@@ -1,0 +1,24 @@
+kind = "mobile"
+previewPath = "/"
+title = "EasyCounter"
+description = "Локальное нативное приложение для iOS и Android, в котором пользователь создает собственные проекты, экраны и параметры. Этап A закладывает мобильную основу, навигацию и локальное хранение без встроенных предметных сценариев."
+version = "1.0.0"
+id = "artifacts/easycounter"
+router = "expo-domain"
+
+[[services]]
+name = "expo"
+ensurePreviewReachable = "/status"
+paths = [ "/" ]
+localPort = 20810
+
+[services.development]
+run = "pnpm --filter @workspace/easycounter run dev"
+
+[services.production]
+build = [ "pnpm", "--filter", "@workspace/easycounter", "run", "build" ]
+run = [ "pnpm", "--filter", "@workspace/easycounter", "run", "serve" ]
+
+[services.env]
+PORT = "20810"
+BASE_PATH = "/"

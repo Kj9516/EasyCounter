@@ -1,44 +1,44 @@
-# [Project name]
+# EasyCounter
 
-_Replace the heading above with the project's name, and this line with one sentence describing what this app does for users._
+Нативное локальное приложение для iOS и Android, в котором пользователь создает собственные проекты и настраиваемые экраны.
 
 ## Run & Operate
 
-- `pnpm --filter @workspace/api-server run dev` — run the API server (port 5000)
-- `pnpm run typecheck` — full typecheck across all packages
-- `pnpm run build` — typecheck + build all packages
-- `pnpm --filter @workspace/api-spec run codegen` — regenerate API hooks and Zod schemas from the OpenAPI spec
-- `pnpm --filter @workspace/db run push` — push DB schema changes (dev only)
-- Required env: `DATABASE_URL` — Postgres connection string
+- `pnpm --filter @workspace/easycounter run dev` — run the Expo mobile app through its managed workflow
+- `pnpm --filter @workspace/easycounter run typecheck` — check the mobile app's TypeScript
+- `pnpm run typecheck` — full typecheck across the workspace
 
 ## Stack
 
-- pnpm workspaces, Node.js 24, TypeScript 5.9
-- API: Express 5
-- DB: PostgreSQL + Drizzle ORM
-- Validation: Zod (`zod/v4`), `drizzle-zod`
-- API codegen: Orval (from OpenAPI spec)
-- Build: esbuild (CJS bundle)
+- React Native + Expo Router + TypeScript
+- Local on-device SQLite through `expo-sqlite`
+- App interface and first-build documentation are in Russian
 
 ## Where things live
 
-_Populate as you build — short repo map plus pointers to the source-of-truth file for DB schema, API contracts, theme files, etc._
+- `artifacts/easycounter/app/` — native routes and screens
+- `artifacts/easycounter/storage/database.ts` — local database schema and project/screen persistence
+- `artifacts/easycounter/types/project.ts` — project and screen types
+- `artifacts/easycounter/components/ProjectProvider.tsx` — shared project state
+- `artifacts/easycounter/DECISIONS.md` — technical decisions and MVP assumptions
 
 ## Architecture decisions
 
-_Populate as you build — non-obvious choices a reader couldn't infer from the code (3-5 bullets)._
+- Project and screen writes use SQLite transactions; projects and screens remain isolated on device.
+- The app remains local-only; no login, server sync, or required network access.
+- User-defined counters, parameter types, rules, widgets, and timers are not implemented as built-in domain concepts; they belong to later engine/editor stages.
 
 ## Product
 
-_Describe the high-level user-facing capabilities of this app once they exist._
+Implementation is staged according to the attached EasyCounter v1.0 specification. Stage A provides project and screen navigation with local persistence. Stages B–D add the general-purpose engine, editors, time features, import/export, and acceptance checks.
 
 ## User preferences
 
-_Populate as you build — explicit user instructions worth remembering across sessions._
+Keep the app native to iOS and Android. Do not replace it with a website or add hard-coded game, score, money, player, or health scenarios. Deliver and report each implementation stage separately.
 
 ## Gotchas
 
-_Populate as you build — sharp edges, "always run X before Y" rules._
+Use `Preview on your phone` in Replit to open the Expo Go QR flow. TypeScript checks do not substitute for checking persistence and navigation on physical iOS and Android devices.
 
 ## Pointers
 
