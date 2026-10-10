@@ -1,0 +1,17 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "composite": false,
+    "declaration": false,
+    "incremental": false,
+    "module": "Node16",
+    "moduleResolution": "Node16",
+    "noEmit": false,
+    "outDir": ".test-build",
+    "rootDir": ".",
+    "skipLibCheck": true,
+    "types": []
+  },
+  "include": ["storage/projectRepository.ts", "types/project.ts"],
+  "exclude": ["node_modules", ".test-build"]
+}

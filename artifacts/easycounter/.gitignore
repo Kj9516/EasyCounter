@@ -5,9 +5,13 @@ node_modules/
 
 # Expo
 .expo/
+.expo-shared/
 dist/
 web-build/
 expo-env.d.ts
+static-build/
+coverage/
+.test-build/
 
 # Native
 ios/
@@ -33,9 +37,25 @@ yarn-error.*
 
 # local env files
 .env*.local
+.env
+.env.*
+!.env.example
 
 # typescript
 *.tsbuildinfo
 .vercel
+
+# Build artifacts and signing material
+*.apk
+*.aab
+*.ipa
+*.keystore
+*.jks
+*.mobileprovision
+*.p8
+*.p12
+*.key
+*.pem
+*.provisionprofile
 
 .env
