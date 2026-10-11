@@ -52,6 +52,7 @@ function RootLayoutNav() {
           }}
         >
           <Stack.Screen name="index" options={{ title: 'EasyCounter' }} />
+          <Stack.Screen name="projects/[projectId]" options={{ headerShown: false }} />
         </Stack>
       </KeyboardProvider>
     </GestureHandlerRootView>
