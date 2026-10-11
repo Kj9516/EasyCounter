@@ -2,7 +2,7 @@
 
 ## Готовый сценарий
 
-Отдельная ветка `device-acceptance` переведена на Expo SDK 54 — SDK, который поддерживает Expo Go для iPhone из App Store. Основная ветка остаётся на SDK 57. Проверка запускается через QR development server; устанавливать EAS development build и иметь Apple Developer Program не нужно. [Expo подтверждает совместимость SDK 54 с App Store версией Expo Go](https://docs.expo.dev/troubleshooting/expo-go-version-mismatch/).
+Ветка `device-acceptance` использует Expo SDK 57, чтобы соответствовать актуальной версии Expo Go для iPhone и Android. Проверка запускается через QR development server; устанавливать EAS development build и иметь Apple Developer Program не нужно. С сентября 2026 года Expo Go из App Store поддерживает SDK 57; для iPhone войдите в один и тот же Expo аккаунт в CLI и в Expo Go ([объявление Expo](https://expo.dev/changelog/expo-go-57-login)).
 
 В приложении сейчас доступны проекты, экраны и настройки проекта. Это проверяет реальный React Native запуск и локальную SQLite-базу. Движок этапа B пока не подключён к визуальному редактору, поэтому его сценарии проверяются автоматическими тестами.
 
@@ -11,9 +11,9 @@
 На компьютере должны быть Node.js 22.13+ и pnpm 10+. На телефоне установите Expo Go:
 
 - iPhone: Expo Go из App Store.
-- Android: Expo Go из Google Play. Если установленная версия не принимает SDK 54, установите SDK 54 build по ссылке [expo.dev/go](https://expo.dev/go).
+- Android: актуальный Expo Go из Google Play.
 
-На iPhone войдите в CLI и Expo Go под одним бесплатным Expo аккаунтом: физический iPhone требует, чтобы они были авторизованы в одном аккаунте при подключении к dev server ([инструкция Expo](https://docs.expo.dev/troubleshooting/expo-go-sign-in-required/)). Пароль и токены не добавляйте в репозиторий.
+На iPhone войдите в CLI и Expo Go под одним Expo аккаунтом: Expo Go для iPhone требует совпадения аккаунта при подключении к dev server ([инструкция Expo](https://docs.expo.dev/troubleshooting/expo-go-sign-in-required/)). Пароль и токены не добавляйте в репозиторий.
 
 ## Запуск
 
