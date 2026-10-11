@@ -7,20 +7,14 @@
     "icon": "./assets/images/icon.png",
     "scheme": "easycounter",
     "userInterfaceStyle": "automatic",
-    "ios": {
-      "bundleIdentifier": "com.kj9516.easycounter.devicecheck",
-      "supportsTablet": false
-    },
-    "android": {
-      "package": "com.kj9516.easycounter.devicecheck"
-    },
+    "ios": { "supportsTablet": false },
+    "android": {},
     "web": {
       "favicon": "./assets/images/icon.png"
     },
     "plugins": [
       "expo-router",
-      "expo-sqlite",
-      "expo-dev-client"
+      "expo-sqlite"
     ],
     "experiments": {
       "typedRoutes": true,

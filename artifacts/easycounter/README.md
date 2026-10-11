@@ -27,7 +27,7 @@
 - Деление и округление используют десятичную модель с ограничениями из `DECISIONS.md`; дата сдвигается только на полные дни, `time` работает по кругу 24 часов.
 - Защита от бесконечного исполнения основана на порционной обработке и API `cancel`/`continue`; обнаружение подозрительных циклов и диалог управления ими относятся к интеграции следующих этапов.
 
-Физический запуск на iPhone или Android и сохранение между полными перезапусками **не подтверждены**. Инструкция и чеклист для устройств — [`docs/device-acceptance.md`](docs/device-acceptance.md). Из-за SDK 57 для iPhone нужен development build; `expo-dev-client` и профиль EAS включены в ветку `device-acceptance`.
+Физический запуск на iPhone или Android и сохранение между полными перезапусками **не подтверждены**. Инструкция и чеклист для устройств — [`docs/device-acceptance.md`](docs/device-acceptance.md). В ветке `device-acceptance` используется Expo SDK 54, чтобы открывать приложение прямо из Expo Go; `pnpm run start:device` запускает QR-сессию в локальной Wi-Fi сети.
 
 ### Последняя автоматическая проверка
 
@@ -43,7 +43,7 @@ Expo export проверяет сборку JS-бандлов, а не запу�
 
 ## Технологии и требования
 
-- React Native, Expo SDK 57, Expo Router, TypeScript.
+- React Native, Expo SDK 54 в ветке `device-acceptance` (SDK 57 в `main`), Expo Router, TypeScript.
 - `expo-sqlite` для локальных данных.
 - Node.js 22.13+ и pnpm 10+.
 - Лицензия не назначена; `LICENSE` намеренно отсутствует.
@@ -70,7 +70,7 @@ pnpm exec expo start --lan
 
 ## Ручная приемка на телефоне
 
-Переключитесь на ветку `device-acceptance` и следуйте [`docs/device-acceptance.md`](docs/device-acceptance.md). Expo Go из App Store на iPhone не подходит для текущего SDK; для обеих платформ настроена установка development build. Проверку нужно записать отдельно для iOS и Android.
+Переключитесь на ветку `device-acceptance` и следуйте [`docs/device-acceptance.md`](docs/device-acceptance.md). Expo Go из App Store на iPhone совместим с SDK 54 на этой ветке. Проверку нужно записать отдельно для iOS и Android.
 
 ## Документы
 
