@@ -19,6 +19,8 @@ import {
   listProjects as readProjects,
   renameProjectScreen as renameStoredProjectScreen,
   updateProject as updateStoredProject,
+  getProjectAccessibilityLabelsEnabled as readProjectAccessibilityLabelsEnabled,
+  setProjectAccessibilityLabelsEnabled as storeProjectAccessibilityLabelsEnabled,
 } from './projectRepository';
 
 const DATABASE_NAME = 'easycounter.db';
@@ -72,6 +74,14 @@ export async function listScreenWidgets(projectId: string, screenId: string): Pr
 
 export async function saveScreenWidgets(projectId: string, screenId: string, widgets: ScreenWidget[]): Promise<void> {
   return persistScreenWidgets(await getDatabase(), projectId, screenId, widgets);
+}
+
+export async function getProjectAccessibilityLabelsEnabled(projectId: string): Promise<boolean> {
+  return readProjectAccessibilityLabelsEnabled(await getDatabase(), projectId);
+}
+
+export async function setProjectAccessibilityLabelsEnabled(projectId: string, enabled: boolean): Promise<void> {
+  return storeProjectAccessibilityLabelsEnabled(await getDatabase(), projectId, enabled);
 }
 
 export async function listProjects(): Promise<Project[]> {

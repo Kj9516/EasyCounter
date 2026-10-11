@@ -5,6 +5,7 @@ import {
   ActivityIndicator,
   Alert,
   StyleSheet,
+  Switch,
   Text,
   TextInput,
   View,
@@ -14,6 +15,7 @@ import { AppButton } from '@/components/AppButton';
 import { KeyboardAwareScrollViewCompat } from '@/components/KeyboardAwareScrollViewCompat';
 import { useProjects } from '@/components/ProjectProvider';
 import { useColors } from '@/hooks/useColors';
+import { getProjectAccessibilityLabelsEnabled, setProjectAccessibilityLabelsEnabled } from '@/storage/database';
 
 export default function ProjectSettingsScreen() {
   const colors = useColors();
@@ -25,6 +27,8 @@ export default function ProjectSettingsScreen() {
   const [name, setName] = useState('');
   const [description, setDescription] = useState('');
   const [saving, setSaving] = useState(false);
+  const [accessibilityLabelsEnabled, setAccessibilityLabelsEnabled] = useState(false);
+  const [savingAccessibility, setSavingAccessibility] = useState(false);
 
   useEffect(() => {
     if (project) {
@@ -32,6 +36,14 @@ export default function ProjectSettingsScreen() {
       setDescription(project.description);
     }
   }, [project?.id]);
+
+  useEffect(() => {
+    let active = true;
+    if (projectId) void getProjectAccessibilityLabelsEnabled(projectId)
+      .then((enabled) => { if (active) setAccessibilityLabelsEnabled(enabled); })
+      .catch(() => undefined);
+    return () => { active = false; };
+  }, [projectId]);
 
   useEffect(() => {
     if (!isLoading && !project) router.replace('/');
@@ -55,6 +67,19 @@ export default function ProjectSettingsScreen() {
       // The provider shows the storage error in a banner.
     } finally {
       setSaving(false);
+    }
+  };
+
+  const handleAccessibilityToggle = async (enabled: boolean) => {
+    if (savingAccessibility) return;
+    setSavingAccessibility(true);
+    try {
+      await setProjectAccessibilityLabelsEnabled(project.id, enabled);
+      setAccessibilityLabelsEnabled(enabled);
+    } catch (error) {
+      Alert.alert('Не удалось сохранить настройку', error instanceof Error ? error.message : String(error));
+    } finally {
+      setSavingAccessibility(false);
     }
   };
 
@@ -126,6 +151,19 @@ export default function ProjectSettingsScreen() {
             { backgroundColor: colors.card, borderColor: colors.input, color: colors.foreground },
           ]}
         />
+        <View style={[styles.divider, { backgroundColor: colors.border }]} />
+        <View style={styles.accessibilityRow}>
+          <View style={styles.accessibilityCopy}>
+            <Text style={[styles.label, { color: colors.foreground, marginTop: 0 }]}>Включить поля VoiceOver</Text>
+            <Text style={[styles.dangerBody, { color: colors.mutedForeground }]}>Показывать дополнительные подписи для чтения виджетов вслух. По умолчанию выключено.</Text>
+          </View>
+          <Switch
+            value={accessibilityLabelsEnabled}
+            disabled={savingAccessibility}
+            onValueChange={(enabled) => void handleAccessibilityToggle(enabled)}
+            trackColor={{ true: colors.primary }}
+          />
+        </View>
         <AppButton
           title={saving ? 'Сохраняем…' : 'Сохранить'}
           icon="check"
@@ -160,6 +198,8 @@ const styles = StyleSheet.create({
   label: { fontFamily: 'Inter_600SemiBold', fontSize: 13, marginTop: 7 },
   input: { minHeight: 54, borderWidth: 1, borderRadius: 15, paddingHorizontal: 15, paddingVertical: 14, fontFamily: 'Inter_400Regular', fontSize: 15 },
   description: { minHeight: 102 },
+  accessibilityRow: { flexDirection: 'row', alignItems: 'center', gap: 12, paddingVertical: 7 },
+  accessibilityCopy: { flex: 1, gap: 5 },
   divider: { height: StyleSheet.hairlineWidth, marginVertical: 12 },
   dangerTitle: { fontFamily: 'Inter_600SemiBold', fontSize: 16 },
   dangerBody: { fontFamily: 'Inter_400Regular', fontSize: 13, lineHeight: 19 },

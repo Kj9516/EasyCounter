@@ -251,6 +251,34 @@ export async function initializeProjectDatabase(
   }
   const verifiedVersion = await db.getFirstAsync<{ user_version: number }>('PRAGMA user_version;');
   if ((verifiedVersion?.user_version ?? 0) < 10) throw new Error('Не удалось обновить структуру виджетов до версии 10.');
+  const preferencesVersion = await db.getFirstAsync<{ user_version: number }>('PRAGMA user_version;');
+  if ((preferencesVersion?.user_version ?? 0) < 11) {
+    await db.withExclusiveTransactionAsync(async (transaction) => {
+      await transaction.execAsync(`
+        CREATE TABLE project_preferences (
+          project_id TEXT PRIMARY KEY NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+          accessibility_labels_enabled INTEGER NOT NULL DEFAULT 0 CHECK(accessibility_labels_enabled IN (0, 1))
+        );
+        PRAGMA user_version = 11;
+      `);
+    });
+  }
+  const latestPreferencesVersion = await db.getFirstAsync<{ user_version: number }>('PRAGMA user_version;');
+  if ((latestPreferencesVersion?.user_version ?? 0) < 11) throw new Error('Не удалось обновить настройки проекта до версии 11.');
+}
+
+export async function getProjectAccessibilityLabelsEnabled(db: SQLiteDatabase, projectId: string): Promise<boolean> {
+  const row = await db.getFirstAsync<{ accessibility_labels_enabled: number }>(
+    'SELECT accessibility_labels_enabled FROM project_preferences WHERE project_id = ?;', projectId,
+  );
+  return row?.accessibility_labels_enabled === 1;
+}
+
+export async function setProjectAccessibilityLabelsEnabled(db: SQLiteDatabase, projectId: string, enabled: boolean): Promise<void> {
+  await db.runAsync(
+    'INSERT INTO project_preferences (project_id, accessibility_labels_enabled) VALUES (?, ?) ON CONFLICT(project_id) DO UPDATE SET accessibility_labels_enabled = excluded.accessibility_labels_enabled;',
+    projectId, enabled ? 1 : 0,
+  );
 }
 
 export async function listScreenWidgets(db: SQLiteDatabase, projectId: string, screenId: string): Promise<ScreenWidget[]> {
