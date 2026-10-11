@@ -1,6 +1,10 @@
 const assert = require('node:assert/strict');
 const { test } = require('node:test');
-const { Decimal, EngineExecutionError, execute } = require('../.test-build/engine/index.js');
+const {
+  Decimal, EngineExecutionError, ConfigurationValidationError, execute,
+  createInitialProjectState, parseExpression, validateProjectConfiguration,
+  resetParameters,
+} = require('../.test-build/engine/index.js');
 
 const integer = (value) => ({ type: 'integer', value: String(value) });
 const decimal = (value) => ({ type: 'decimal', value: String(value) });
@@ -8,26 +12,18 @@ const literal = (value) => ({ kind: 'literal', value: integer(value) });
 const reference = (id) => ({ kind: 'parameter', id });
 const binary = (op, left, right) => ({ kind: 'binary', op, left, right });
 const parameter = (id, value, type = 'integer') => ({
-  id,
-  name: id,
-  type,
-  value: type === 'integer' ? integer(value) : decimal(value),
+  id, name: id, type, kind: 'stored',
   initialValue: type === 'integer' ? integer(value) : decimal(value),
 });
-const rule = (id, eventSource, actions, condition) => ({
-  id,
-  name: id,
-  enabled: true,
-  order: 0,
-  eventSource,
-  actions,
-  condition,
+const rule = (id, eventSource, actions, condition, order = 0, triggerMode = 'each') => ({
+  id, name: id, enabled: true, order, eventSource, triggerMode, actions, condition,
 });
 const button = (id) => ({ type: 'button', sourceId: id });
 const completed = (result) => {
   assert.equal(result.status, 'completed');
   return result;
 };
+const config = (parameters, rules = []) => ({ parameters, rules });
 
 test('decimal arithmetic is exact, bounded, and rounds division half away from zero', () => {
   assert.equal(Decimal.parse('0.1').add(Decimal.parse('0.2')).toString(), '0.3');
@@ -41,159 +37,180 @@ test('decimal arithmetic is exact, bounded, and rounds division half away from z
 });
 
 test('counter handles repeated root events', () => {
-  let state = {
-    parameters: [parameter('N', 0)],
-    rules: [rule('plus', { type: 'button', id: 'plus' }, [
-      { type: 'add', parameterId: 'N', expression: literal(5) },
-    ])],
-  };
+  let state = createInitialProjectState(config([parameter('N', 0)], [rule('plus', { type: 'button', id: 'plus' }, [
+    { type: 'add', parameterId: 'N', expression: literal(5) },
+  ])]));
   for (let index = 0; index < 3; index++) state = completed(execute(state, button('plus'))).state;
-  assert.equal(state.parameters[0].value.value, '15');
+  assert.equal(state.runtime.values.N.value, '15');
 });
 
-test('actions are sequential and preserve every change event snapshot in FIFO order', () => {
-  const result = completed(execute({
-    parameters: [parameter('A', 0), parameter('B', 0)],
-    rules: [
-      rule('button', { type: 'button', id: 'go' }, [
-        { type: 'set', parameterId: 'A', expression: literal(5) },
-        { type: 'set', parameterId: 'A', expression: literal(10) },
-        { type: 'set', parameterId: 'A', expression: literal(15) },
-      ]),
-      rule('on-change', { type: 'changed', parameterId: 'A' }, [
-        { type: 'add', parameterId: 'B', expression: literal(1) },
-      ]),
-    ],
-  }, button('go')));
-
+test('actions are sequential and preserve change snapshots in FIFO order', () => {
+  const state = createInitialProjectState(config([parameter('A', 0), parameter('B', 0)], [
+    rule('button', { type: 'button', id: 'go' }, [
+      { type: 'set', parameterId: 'A', expression: literal(5) },
+      { type: 'set', parameterId: 'A', expression: literal(10) },
+      { type: 'set', parameterId: 'A', expression: literal(15) },
+    ]),
+    rule('on-change', { type: 'changed', parameterId: 'A' }, [
+      { type: 'add', parameterId: 'B', expression: literal(1) },
+    ], undefined, 1),
+  ]));
+  const result = completed(execute(state, button('go')));
   assert.deepEqual(result.changes.filter((change) => change.parameterId === 'A')
-    .map(({ oldValue, newValue }) => [oldValue.value, newValue.value]), [
-    ['0', '5'], ['5', '10'], ['10', '15'],
-  ]);
-  assert.equal(result.state.parameters.find((item) => item.id === 'B').value.value, '3');
+    .map(({ oldValue, newValue }) => [oldValue.value, newValue.value]), [['0', '5'], ['5', '10'], ['10', '15']]);
+  assert.equal(result.state.runtime.values.B.value, '3');
   assert.deepEqual(result.events.filter((event) => event.type === 'changed')
     .map(({ sourceId, oldValue, newValue }) => [sourceId, oldValue.value, newValue.value]), [
-    ['A', '0', '5'], ['A', '5', '10'], ['A', '10', '15'],
-    ['B', '0', '1'], ['B', '1', '2'], ['B', '2', '3'],
-  ]);
-  assert.ok(result.events.every((event) => typeof event.occurredAt === 'string'));
+      ['A', '0', '5'], ['A', '5', '10'], ['A', '10', '15'],
+      ['B', '0', '1'], ['B', '1', '2'], ['B', '2', '3'],
+    ]);
 });
 
-test('rule order follows the configured order and actions see prior changes', () => {
-  const result = completed(execute({
-    parameters: [parameter('Gold', 100), parameter('Silver', 50)],
-    rules: [rule('sequence', { type: 'button', id: 'go' }, [
+test('changed-event snapshots expose oldValue, newValue, and delta to rules', () => {
+  const state = createInitialProjectState(config([parameter('A', 0), parameter('B', 0)], [
+    rule('set', { type: 'button', id: 'go' }, [{ type: 'set', parameterId: 'A', expression: literal(7) }]),
+    rule('snapshot', { type: 'changed', parameterId: 'A' }, [{
+      type: 'set', parameterId: 'B', expression: binary('+', { kind: 'event', field: 'oldValue' }, { kind: 'event', field: 'delta' }),
+    }], undefined, 1),
+  ]));
+  const result = completed(execute(state, button('go')));
+  assert.equal(result.state.runtime.values.B.value, '7');
+});
+
+test('rule order follows configured order and actions see prior changes', () => {
+  const result = completed(execute(createInitialProjectState(config([parameter('Gold', 100), parameter('Silver', 50)], [
+    rule('sequence', { type: 'button', id: 'go' }, [
       { type: 'set', parameterId: 'Gold', expression: binary('*', reference('Gold'), literal(2)) },
       { type: 'set', parameterId: 'Silver', expression: binary('+', reference('Silver'), binary('-', reference('Silver'), reference('Gold'))) },
-    ])],
-  }, button('go')));
-  assert.equal(result.state.parameters.find((item) => item.id === 'Gold').value.value, '200');
-  assert.equal(result.state.parameters.find((item) => item.id === 'Silver').value.value, '-100');
+    ]),
+  ])), button('go')));
+  assert.equal(result.state.runtime.values.Gold.value, '200');
+  assert.equal(result.state.runtime.values.Silver.value, '-100');
 });
 
-test('numeric conversion and floor produce correct integer results', () => {
-  const result = completed(execute({
-    parameters: [parameter('Cents', 95), parameter('Dollars', 0)],
-    rules: [rule('convert', { type: 'button', id: 'add' }, [
+test('numeric conversion and floor support the cents conversion scenario', () => {
+  const result = completed(execute(createInitialProjectState(config([parameter('Cents', 95), parameter('Dollars', 0)], [
+    rule('convert', { type: 'button', id: 'add' }, [
       { type: 'add', parameterId: 'Cents', expression: literal(250) },
       { type: 'add', parameterId: 'Dollars', expression: { kind: 'call', fn: 'floor', args: [binary('/', reference('Cents'), literal(100))] } },
-      { type: 'set', parameterId: 'Cents', expression: { kind: 'binary', op: 'mod', left: reference('Cents'), right: literal(100) } },
-    ])],
-  }, button('add')));
-  assert.equal(result.state.parameters.find((item) => item.id === 'Cents').value.value, '45');
-  assert.equal(result.state.parameters.find((item) => item.id === 'Dollars').value.value, '3');
+      { type: 'set', parameterId: 'Cents', expression: binary('mod', reference('Cents'), literal(100)) },
+    ]),
+  ])), button('add')));
+  assert.equal(result.state.runtime.values.Cents.value, '45');
+  assert.equal(result.state.runtime.values.Dollars.value, '3');
 });
 
-test('failure reports rule and action details and leaves caller state unchanged', () => {
-  const state = {
-    parameters: [parameter('A', 0)],
-    rules: [rule('fail', { type: 'button', id: 'go' }, [
-      { type: 'set', parameterId: 'A', expression: literal(5) },
-      { type: 'set', parameterId: 'A', expression: binary('/', literal(1), literal(0)) },
-    ])],
-  };
-  let failure;
-  try {
-    execute(state, button('go'));
-  } catch (error) {
-    failure = error;
-  }
-  assert.ok(failure instanceof EngineExecutionError);
-  assert.equal(failure.details.ruleId, 'fail');
-  assert.equal(failure.details.actionIndex, 1);
-  assert.match(failure.message, /Division by zero/);
-  assert.equal(state.parameters[0].value.value, '0');
+test('computed values update immediately and reject dependency cycles', () => {
+  const total = { id: 'Total', name: 'Total', type: 'integer', kind: 'computed', initialValue: integer(0), formula: binary('+', reference('A'), reference('B')) };
+  const state = createInitialProjectState(config([parameter('A', 2), parameter('B', 3), total], [rule('add', { type: 'button', id: 'go' }, [
+    { type: 'add', parameterId: 'A', expression: literal(5) },
+    { type: 'add', parameterId: 'B', expression: reference('Total') },
+  ])]));
+  const result = completed(execute(state, button('go')));
+  assert.equal(result.state.runtime.values.Total.value, '20');
+  assert.deepEqual(result.changes.map((change) => change.parameterId), ['A', 'Total', 'B', 'Total']);
+  const a = { id: 'A', name: 'A', type: 'integer', kind: 'computed', initialValue: integer(0), formula: reference('B') };
+  const b = { id: 'B', name: 'B', type: 'integer', kind: 'computed', initialValue: integer(0), formula: reference('A') };
+  assert.throws(() => validateProjectConfiguration(config([a, b])), /cycle/i);
 });
 
-test('a long chain suspends in slices and can continue to completion without a total step limit', () => {
-  let result = execute({
-    parameters: [parameter('A', 0)],
-    rules: [
-      rule('start', { type: 'button', id: 'go' }, [
-        { type: 'add', parameterId: 'A', expression: literal(1) },
-      ]),
-      {
-        ...rule('until-target', { type: 'changed', parameterId: 'A' }, [
-          { type: 'add', parameterId: 'A', expression: literal(1) },
-        ], binary('<', reference('A'), literal(2500))),
-        order: 1,
-      },
-    ],
-  }, button('go'), { maxActionsPerSlice: 17 });
+test('safe parser handles precedence and rejects executable JavaScript', () => {
+  const ast = parseExpression('1 + 2 * 3');
+  const state = createInitialProjectState(config([parameter('A', 0)], [rule('parsed', { type: 'button', id: 'go' }, [
+    { type: 'set', parameterId: 'A', expression: ast },
+  ])]));
+  assert.equal(completed(execute(state, button('go'))).state.runtime.values.A.value, '7');
+  assert.throws(() => parseExpression('globalThis.process.exit()'), /Недопустимый|Unexpected|Expected|Unsupported/);
+  assert.throws(() => parseExpression('1 + (2'), /Ожидался|Expected/);
+});
 
+test('rule failure reports context and discards all changes', () => {
+  const state = createInitialProjectState(config([parameter('A', 0)], [rule('fail', { type: 'button', id: 'go' }, [
+    { type: 'set', parameterId: 'A', expression: literal(5) },
+    { type: 'add', parameterId: 'A', expression: binary('/', literal(1), literal(0)) },
+  ])]));
+  assert.throws(() => execute(state, button('go')), (error) => {
+    assert.ok(error instanceof EngineExecutionError);
+    assert.equal(error.details.ruleId, 'fail');
+    assert.equal(error.details.actionIndex, 1);
+    assert.match(error.message, /Division by zero/);
+    return true;
+  });
+  assert.equal(state.runtime.values.A.value, '0');
+});
+
+test('rising edge runs once while a condition stays true', () => {
+  const state = createInitialProjectState(config([parameter('A', 0), parameter('B', 0)], [
+    rule('set', { type: 'button', id: 'go' }, [{ type: 'set', parameterId: 'A', expression: literal(1) }]),
+    rule('edge', { type: 'button', id: 'go' }, [{ type: 'add', parameterId: 'B', expression: literal(1) }], binary('>', reference('A'), literal(0)), 1, 'risingEdge'),
+  ]));
+  let result = completed(execute(state, button('go')));
+  assert.equal(result.state.runtime.values.B.value, '1');
+  result = completed(execute(result.state, button('go')));
+  assert.equal(result.state.runtime.values.B.value, '1');
+});
+
+test('list operations validate indexes and update the value atomically', () => {
+  const items = { id: 'Items', name: 'Items', kind: 'stored', type: 'list', listItemType: 'integer', initialValue: { type: 'list', itemType: 'integer', value: [integer(1), integer(2)] } };
+  let state = createInitialProjectState(config([items], [rule('list', { type: 'button', id: 'go' }, [
+    { type: 'listAdd', parameterId: 'Items', expression: literal(3) },
+    { type: 'listReplace', parameterId: 'Items', index: literal(0), expression: literal(4) },
+    { type: 'listRemove', parameterId: 'Items', index: literal(1) },
+  ])]));
+  state = completed(execute(state, button('go'))).state;
+  assert.deepEqual(state.runtime.values.Items.value.map((item) => item.value), ['4', '3']);
+  const bad = createInitialProjectState(config([items], [rule('bad-index', { type: 'button', id: 'go' }, [
+    { type: 'listRemove', parameterId: 'Items', index: literal(9) },
+  ])]));
+  assert.throws(() => execute(bad, button('go')), /out of range/);
+});
+
+test('date and duration arithmetic is canonical', () => {
+  const date = { id: 'Date', name: 'Date', kind: 'stored', type: 'date', initialValue: { type: 'date', value: '2024-02-28' } };
+  const nextDate = { id: 'Next', name: 'Next', kind: 'computed', type: 'date', initialValue: { type: 'date', value: '2024-01-01' }, formula: binary('+', reference('Date'), { kind: 'literal', value: { type: 'duration', value: '86400000' } }) };
+  const state = createInitialProjectState(config([date, nextDate]));
+  assert.equal(state.runtime.values.Next.value, '2024-02-29');
+});
+
+test('long chains suspend in bounded slices and can be cancelled without exposing changes', () => {
+  const state = createInitialProjectState(config([parameter('A', 0)], [
+    rule('start', { type: 'button', id: 'go' }, [{ type: 'add', parameterId: 'A', expression: literal(1) }]),
+    rule('until-target', { type: 'changed', parameterId: 'A' }, [{ type: 'add', parameterId: 'A', expression: literal(1) }], binary('<', reference('A'), literal(2500)), 1),
+  ]));
+  let result = execute(state, button('go'), { maxActionsPerSlice: 17 });
   let slices = 1;
-  while (result.status === 'suspended') {
-    result = result.continue(17);
-    slices++;
-  }
+  while (result.status === 'suspended') { result = result.continue(17); slices++; }
   assert.ok(slices > 100);
-  assert.equal(result.state.parameters[0].value.value, '2500');
+  assert.equal(result.state.runtime.values.A.value, '2500');
   assert.equal(result.changes.length, 2500);
+  let suspended = execute(state, button('go'), { maxActionsPerSlice: 1 });
+  assert.equal(suspended.status, 'suspended');
+  suspended.cancel();
+  assert.equal(state.runtime.values.A.value, '0');
+  assert.throws(() => suspended.continue(), /cancelled/);
 });
 
-test('cancelling a suspended chain does not expose partial state', () => {
-  const state = {
-    parameters: [parameter('A', 0)],
-    rules: [
-      rule('start', { type: 'button', id: 'go' }, [
-        { type: 'add', parameterId: 'A', expression: literal(1) },
-      ]),
-      { ...rule('loop', { type: 'changed', parameterId: 'A' }, [
-        { type: 'add', parameterId: 'A', expression: literal(1) },
-      ]), order: 1 },
-    ],
-  };
-  const result = execute(state, button('go'), { maxActionsPerSlice: 2 });
-  assert.equal(result.status, 'suspended');
-  result.cancel();
-  assert.equal(state.parameters[0].value.value, '0');
-  assert.throws(() => result.continue(), /cancelled/);
-});
-
-test('a suspended operation keeps its own snapshot of configuration and values', () => {
-  const state = {
-    parameters: [parameter('A', 0)],
-    rules: [rule('two-actions', { type: 'button', id: 'go' }, [
-      { type: 'add', parameterId: 'A', expression: literal(1) },
-      { type: 'add', parameterId: 'A', expression: literal(2) },
-    ])],
-  };
-  let result = execute(state, button('go'), { maxActionsPerSlice: 1 });
-  assert.equal(result.status, 'suspended');
-  state.parameters[0].value = integer(999);
-  state.rules[0].actions[1].expression = literal(1000);
-  result = result.continue(1);
-  assert.equal(result.status, 'completed');
-  assert.equal(result.state.parameters[0].value.value, '3');
-});
-
-test('equal assignments do not create change events', () => {
-  const result = completed(execute({
-    parameters: [parameter('A', 4)],
-    rules: [rule('same', { type: 'button', id: 'go' }, [
-      { type: 'set', parameterId: 'A', expression: literal(4) },
-    ])],
-  }, button('go')));
+test('equal assignments emit assignment events but no changed event', () => {
+  const state = createInitialProjectState(config([parameter('A', 4)], [rule('same', { type: 'button', id: 'go' }, [
+    { type: 'set', parameterId: 'A', expression: literal(4) },
+  ])]));
+  const result = completed(execute(state, button('go')));
   assert.equal(result.changes.length, 0);
-  assert.equal(result.events.length, 1);
+  assert.deepEqual(result.events.map((event) => event.type), ['button', 'assigned']);
+});
+
+test('reset supports all or selected stored parameters and emits normal changes', () => {
+  const state = createInitialProjectState(config([
+    { ...parameter('A', 5), initialValue: integer(0) },
+    { ...parameter('B', 9), initialValue: integer(2) },
+  ]));
+  const changed = completed(execute(state, button('unused'), { maxActionsPerSlice: 1 }));
+  const populated = { ...changed.state, runtime: { ...changed.state.runtime, values: { A: integer(5), B: integer(9) } } };
+  const selected = completed(resetParameters(populated, ['A']));
+  assert.equal(selected.state.runtime.values.A.value, '0');
+  assert.equal(selected.state.runtime.values.B.value, '9');
+  assert.equal(selected.changes[0].ruleId, null);
+  const all = completed(resetParameters(selected.state));
+  assert.equal(all.state.runtime.values.A.value, '0');
+  assert.equal(all.state.runtime.values.B.value, '2');
 });

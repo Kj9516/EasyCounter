@@ -1,5 +1,7 @@
 import type { SQLiteDatabase } from 'expo-sqlite';
 import type { Project, ProjectDraft, ProjectScreen } from '../types/project';
+import { rehydrateProjectState } from '../engine/configuration';
+import type { ExecutionResult, ProjectConfiguration, ProjectState, RuntimeState } from '../engine/types';
 
 interface ProjectRow {
   id: string;
@@ -15,6 +17,30 @@ interface ScreenRow {
   name: string;
   position: number;
   created_at: string;
+}
+
+interface EngineStateRow {
+  project_id: string;
+  configuration_json: string;
+  runtime_json: string;
+  revision: number;
+}
+
+export interface OperationHistoryEntry {
+  id: number;
+  projectId: string;
+  occurredAt: string;
+  rootEvent: ExecutionResult['rootEvent'];
+  changes: ExecutionResult['changes'];
+  revision: number;
+}
+
+function parseJson<T>(value: string, label: string): T {
+  try {
+    return JSON.parse(value) as T;
+  } catch (error) {
+    throw new Error(`Не удалось прочитать ${label}: ${error instanceof Error ? error.message : String(error)}`);
+  }
 }
 
 function makeId(): string {
@@ -61,6 +87,39 @@ export async function initializeProjectDatabase(
 
         PRAGMA user_version = 1;
       `);
+    });
+  }
+
+  const currentVersion = await db.getFirstAsync<{ user_version: number }>('PRAGMA user_version;');
+  if ((currentVersion?.user_version ?? 0) < 2) {
+    await db.withExclusiveTransactionAsync(async (transaction) => {
+      await transaction.execAsync(`
+        CREATE TABLE IF NOT EXISTS project_engine_state (
+          project_id TEXT PRIMARY KEY NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+          configuration_json TEXT NOT NULL,
+          runtime_json TEXT NOT NULL,
+          revision INTEGER NOT NULL DEFAULT 0,
+          updated_at TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS project_operation_history (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+          occurred_at TEXT NOT NULL,
+          root_event_json TEXT NOT NULL,
+          changes_json TEXT NOT NULL,
+          revision INTEGER NOT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS project_operation_history_project_id
+          ON project_operation_history(project_id, id DESC);
+
+        INSERT OR IGNORE INTO project_engine_state
+          (project_id, configuration_json, runtime_json, revision, updated_at)
+          SELECT id, '{"parameters":[],"rules":[]}', '{"values":{},"ruleTruth":{}}', 0, updated_at
+          FROM projects;
+      `);
+      await transaction.execAsync('PRAGMA user_version = 2;');
     });
   }
 }
@@ -145,6 +204,13 @@ export async function createProject(
       0,
       now,
     );
+    await transaction.runAsync(
+      'INSERT INTO project_engine_state (project_id, configuration_json, runtime_json, revision, updated_at) VALUES (?, ?, ?, 0, ?);',
+      id,
+      JSON.stringify({ parameters: [], rules: [] }),
+      JSON.stringify({ values: {}, ruleTruth: {} }),
+      now,
+    );
   });
 
   return project;
@@ -191,6 +257,19 @@ export async function duplicateProject(
         screen.name,
         screen.position,
         screen.createdAt,
+      );
+    }
+    const engineState = await transaction.getFirstAsync<EngineStateRow>(
+      'SELECT project_id, configuration_json, runtime_json, revision FROM project_engine_state WHERE project_id = ?;',
+      projectId,
+    );
+    if (engineState) {
+      await transaction.runAsync(
+        'INSERT INTO project_engine_state (project_id, configuration_json, runtime_json, revision, updated_at) VALUES (?, ?, ?, 0, ?);',
+        duplicateId,
+        engineState.configuration_json,
+        engineState.runtime_json,
+        now,
       );
     }
   });
@@ -288,4 +367,105 @@ export async function deleteProjectScreen(
       projectId,
     );
   });
+}
+
+export async function loadProjectEngineState(
+  db: SQLiteDatabase,
+  projectId: string,
+): Promise<ProjectState> {
+  const row = await db.getFirstAsync<EngineStateRow>(
+    'SELECT project_id, configuration_json, runtime_json, revision FROM project_engine_state WHERE project_id = ?;',
+    projectId,
+  );
+  if (!row) throw new Error('Не удалось найти состояние проекта.');
+  const configuration = parseJson<ProjectConfiguration>(row.configuration_json, 'конфигурацию проекта');
+  const runtime = parseJson<RuntimeState>(row.runtime_json, 'состояние параметров');
+  return rehydrateProjectState(configuration, runtime, row.revision);
+}
+
+export async function saveProjectEngineConfiguration(
+  db: SQLiteDatabase,
+  projectId: string,
+  configuration: ProjectConfiguration,
+): Promise<ProjectState> {
+  // Initialize and validate before opening the transaction so invalid edits never replace saved data.
+  const now = new Date().toISOString();
+  let savedState: ProjectState | undefined;
+  await db.withExclusiveTransactionAsync(async (transaction) => {
+    const current = await transaction.getFirstAsync<EngineStateRow>(
+      'SELECT project_id, configuration_json, runtime_json, revision FROM project_engine_state WHERE project_id = ?;',
+      projectId,
+    );
+    if (!current) throw new Error('Не удалось найти состояние проекта.');
+    const oldRuntime = parseJson<RuntimeState>(current.runtime_json, 'состояние параметров');
+    const revision = current.revision + 1;
+    const next = rehydrateProjectState(configuration, oldRuntime, revision);
+    await transaction.runAsync(
+      'UPDATE project_engine_state SET configuration_json = ?, runtime_json = ?, revision = ?, updated_at = ? WHERE project_id = ?;',
+      JSON.stringify(configuration),
+      JSON.stringify(next.runtime),
+      revision,
+      now,
+      projectId,
+    );
+    savedState = next;
+  });
+  return savedState!;
+}
+
+export async function commitEngineExecution(
+  db: SQLiteDatabase,
+  projectId: string,
+  execution: ExecutionResult,
+): Promise<ProjectState> {
+  if (execution.status !== 'completed') throw new Error('Only completed operations can be committed.');
+  const now = new Date().toISOString();
+  let committedState: ProjectState | undefined;
+  await db.withExclusiveTransactionAsync(async (transaction) => {
+    const current = await transaction.getFirstAsync<EngineStateRow>(
+      'SELECT project_id, configuration_json, runtime_json, revision FROM project_engine_state WHERE project_id = ?;',
+      projectId,
+    );
+    if (!current) throw new Error('Не удалось найти состояние проекта.');
+    if (current.revision !== execution.baseRevision) {
+      throw new Error(`Состояние проекта уже изменилось (ожидалась версия ${execution.baseRevision}, текущая ${current.revision}).`);
+    }
+    const configuration = parseJson<ProjectConfiguration>(current.configuration_json, 'конфигурацию проекта');
+    const runtime = rehydrateProjectState(configuration, execution.state.runtime, current.revision + 1).runtime;
+    const revision = current.revision + 1;
+    await transaction.runAsync(
+      'UPDATE project_engine_state SET runtime_json = ?, revision = ?, updated_at = ? WHERE project_id = ? AND revision = ?;',
+      JSON.stringify(runtime), revision, now, projectId, current.revision,
+    );
+    await transaction.runAsync(
+      'INSERT INTO project_operation_history (project_id, occurred_at, root_event_json, changes_json, revision) VALUES (?, ?, ?, ?, ?);',
+      projectId,
+      execution.rootEvent.occurredAt ?? now,
+      JSON.stringify(execution.rootEvent),
+      JSON.stringify(execution.changes),
+      revision,
+    );
+    committedState = { config: configuration, runtime, revision };
+  });
+  return committedState!;
+}
+
+export async function listProjectOperationHistory(
+  db: SQLiteDatabase,
+  projectId: string,
+): Promise<OperationHistoryEntry[]> {
+  const rows = await db.getAllAsync<{
+    id: number; project_id: string; occurred_at: string; root_event_json: string; changes_json: string; revision: number;
+  }>(
+    'SELECT id, project_id, occurred_at, root_event_json, changes_json, revision FROM project_operation_history WHERE project_id = ? ORDER BY id DESC;',
+    projectId,
+  );
+  return rows.map((row) => ({
+    id: row.id,
+    projectId: row.project_id,
+    occurredAt: row.occurred_at,
+    rootEvent: parseJson<ExecutionResult['rootEvent']>(row.root_event_json, 'событие истории'),
+    changes: parseJson<ExecutionResult['changes']>(row.changes_json, 'изменения истории'),
+    revision: row.revision,
+  }));
 }

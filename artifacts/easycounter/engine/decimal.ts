@@ -105,6 +105,20 @@ export class Decimal {
     return Decimal.normalize(value, 0);
   }
 
+  round(precision = 0): Decimal {
+    if (!Number.isInteger(precision) || precision < 0 || precision > MAX_DECIMAL_SCALE) {
+      throw new Error('Invalid rounding precision');
+    }
+    if (this.scale <= precision) return this;
+    const discardedPlaces = this.scale - precision;
+    const divisor = 10n ** BigInt(discardedPlaces);
+    let quotient = this.coefficient / divisor;
+    const remainder = this.coefficient % divisor;
+    const absRemainder = remainder < 0n ? -remainder : remainder;
+    if (absRemainder * 2n >= divisor) quotient += this.coefficient < 0n ? -1n : 1n;
+    return Decimal.normalize(quotient, precision);
+  }
+
   mod(other: Decimal): Decimal {
     if (other.coefficient === 0n) throw new Error('Division by zero');
     const [left, right, scale] = this.align(other);

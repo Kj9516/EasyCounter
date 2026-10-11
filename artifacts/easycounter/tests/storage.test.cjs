@@ -6,6 +6,7 @@ const { tmpdir } = require('node:os');
 const { join } = require('node:path');
 
 const repository = require('../.test-build/storage/projectRepository.js');
+const engine = require('../.test-build/engine/index.js');
 
 class NodeSqliteAdapter {
   constructor(filename) {
@@ -82,6 +83,65 @@ test('creates and reads a project with its initial screen', async () => {
   const [loaded] = await repository.listProjects(database);
   assert.equal(loaded.id, created.id);
   assert.equal(loaded.screens[0].id, created.screens[0].id);
+  const state = await repository.loadProjectEngineState(database, created.id);
+  assert.deepEqual(state.config, { parameters: [], rules: [] });
+  assert.equal(state.revision, 0);
+});
+
+test('configuration, operation state, and successful history commit atomically', async () => {
+  const project = await repository.createProject(database, { name: 'Engine storage', description: '' });
+  const integer = (value) => ({ type: 'integer', value: String(value) });
+  const config = {
+    parameters: [{ id: 'Count', name: 'Count', kind: 'stored', type: 'integer', initialValue: integer(0) }],
+    rules: [{
+      id: 'increment', name: 'Increment', enabled: true, order: 0, triggerMode: 'each',
+      eventSource: { type: 'button', id: 'plus' },
+      actions: [{ type: 'add', parameterId: 'Count', expression: { kind: 'literal', value: integer(1) } }],
+    }],
+  };
+  let state = await repository.saveProjectEngineConfiguration(database, project.id, config);
+  assert.equal(state.revision, 1);
+  const operation = engine.execute(state, { type: 'button', sourceId: 'plus' });
+  assert.equal(operation.status, 'completed');
+  state = await repository.commitEngineExecution(database, project.id, operation);
+  assert.equal(state.runtime.values.Count.value, '1');
+  assert.equal(state.revision, 2);
+  assert.equal((await repository.loadProjectEngineState(database, project.id)).runtime.values.Count.value, '1');
+  const [entry] = await repository.listProjectOperationHistory(database, project.id);
+  assert.equal(entry.revision, 2);
+  assert.equal(entry.rootEvent.sourceId, 'plus');
+  assert.equal(entry.changes.length, 1);
+
+  await assert.rejects(repository.commitEngineExecution(database, project.id, operation), /уже изменилось/);
+  assert.equal((await repository.listProjectOperationHistory(database, project.id)).length, 1);
+  const nextOperation = engine.execute(state, { type: 'button', sourceId: 'plus' });
+  await database.execAsync(`CREATE TRIGGER fail_history_insert BEFORE INSERT ON project_operation_history BEGIN SELECT RAISE(ABORT, 'history unavailable'); END;`);
+  await assert.rejects(repository.commitEngineExecution(database, project.id, nextOperation), /history unavailable/);
+  assert.equal((await repository.loadProjectEngineState(database, project.id)).runtime.values.Count.value, '1');
+  assert.equal((await repository.listProjectOperationHistory(database, project.id)).length, 1);
+  await database.execAsync('DROP TRIGGER fail_history_insert;');
+  const reconfigured = await repository.saveProjectEngineConfiguration(database, project.id, config);
+  assert.equal(reconfigured.revision, 3);
+  await assert.rejects(repository.commitEngineExecution(database, project.id, operation), /ожидалась версия 1, текущая 3/);
+});
+
+test('failed and stale operations do not change committed state or operation history', async () => {
+  const project = await repository.createProject(database, { name: 'Rollback', description: '' });
+  const integer = (value) => ({ type: 'integer', value: String(value) });
+  const config = {
+    parameters: [{ id: 'Count', name: 'Count', kind: 'stored', type: 'integer', initialValue: integer(0) }],
+    rules: [{
+      id: 'increment', name: 'Increment', enabled: true, order: 0, triggerMode: 'each', eventSource: { type: 'button', id: 'plus' },
+      actions: [{ type: 'add', parameterId: 'Count', expression: { kind: 'literal', value: integer(1) } }],
+    }],
+  };
+  const state = await repository.saveProjectEngineConfiguration(database, project.id, config);
+  const first = engine.execute(state, { type: 'button', sourceId: 'plus' });
+  const competing = engine.execute(state, { type: 'button', sourceId: 'plus' });
+  await repository.commitEngineExecution(database, project.id, first);
+  await assert.rejects(repository.commitEngineExecution(database, project.id, competing), /уже изменилось/);
+  assert.equal((await repository.loadProjectEngineState(database, project.id)).runtime.values.Count.value, '1');
+  assert.equal((await repository.listProjectOperationHistory(database, project.id)).length, 1);
 });
 
 test('updates and deletes a project', async () => {
@@ -170,6 +230,26 @@ test('persists projects and screens after closing and reopening SQLite', async (
   assert.equal(loaded.screens[1].name, 'Persisted screen');
 });
 
+test('migrates an existing version 1 project to the engine tables', async () => {
+  const filename = join(directory, 'legacy.db');
+  const legacy = new NodeSqliteAdapter(filename);
+  await legacy.execAsync(`
+    CREATE TABLE projects (id TEXT PRIMARY KEY NOT NULL, name TEXT NOT NULL, description TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+    CREATE TABLE project_screens (id TEXT PRIMARY KEY NOT NULL, project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE, name TEXT NOT NULL, position INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL);
+    PRAGMA user_version = 1;
+  `);
+  await legacy.runAsync('INSERT INTO projects (id, name, description, created_at, updated_at) VALUES (?, ?, ?, ?, ?);', 'legacy', 'Legacy', '', new Date().toISOString(), new Date().toISOString());
+  await legacy.close();
+  const migrated = await openStore(filename);
+  try {
+    const state = await repository.loadProjectEngineState(migrated, 'legacy');
+    assert.deepEqual(state.config, { parameters: [], rules: [] });
+    assert.equal((await migrated.getFirstAsync('PRAGMA user_version;')).user_version, 2);
+  } finally {
+    migrated.close();
+  }
+});
+
 test('duplicates projects with distinct project and screen IDs', async () => {
   const source = await repository.createProject(database, {
     name: 'Copy source',
@@ -181,6 +261,8 @@ test('duplicates projects with distinct project and screen IDs', async () => {
   assert.equal(duplicate.name, 'Copy source (копия)');
   assert.notEqual(duplicate.screens[0].id, source.screens[0].id);
   assert.equal((await repository.listProjects(database)).length, 2);
+  assert.deepEqual((await repository.loadProjectEngineState(database, duplicate.id)).config, { parameters: [], rules: [] });
+  assert.equal((await repository.listProjectOperationHistory(database, duplicate.id)).length, 0);
 });
 
 test('rejects blank names and missing project/screen updates', async () => {

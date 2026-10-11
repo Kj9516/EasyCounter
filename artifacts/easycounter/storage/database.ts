@@ -1,5 +1,7 @@
 import * as SQLite from 'expo-sqlite';
 import type { Project, ProjectDraft, ProjectScreen } from '../types/project';
+import type { ExecutionResult, ProjectConfiguration, ProjectState } from '../engine/types';
+import type { OperationHistoryEntry } from './projectRepository';
 import {
   createProject as insertProject,
   createProjectScreen as insertProjectScreen,
@@ -7,6 +9,10 @@ import {
   deleteProjectScreen as removeProjectScreen,
   duplicateProject as duplicateStoredProject,
   initializeProjectDatabase,
+  loadProjectEngineState as readProjectEngineState,
+  saveProjectEngineConfiguration as saveEngineConfiguration,
+  commitEngineExecution as persistEngineExecution,
+  listProjectOperationHistory as readProjectOperationHistory,
   listProjects as readProjects,
   renameProjectScreen as renameStoredProjectScreen,
   updateProject as updateStoredProject,
@@ -28,6 +34,28 @@ async function getDatabase(): Promise<SQLite.SQLiteDatabase> {
     });
   }
   return databasePromise;
+}
+
+export async function loadProjectEngineState(projectId: string): Promise<ProjectState> {
+  return readProjectEngineState(await getDatabase(), projectId);
+}
+
+export async function saveProjectEngineConfiguration(
+  projectId: string,
+  configuration: ProjectConfiguration,
+): Promise<ProjectState> {
+  return saveEngineConfiguration(await getDatabase(), projectId, configuration);
+}
+
+export async function commitEngineExecution(
+  projectId: string,
+  execution: ExecutionResult,
+): Promise<ProjectState> {
+  return persistEngineExecution(await getDatabase(), projectId, execution);
+}
+
+export async function listProjectOperationHistory(projectId: string): Promise<OperationHistoryEntry[]> {
+  return readProjectOperationHistory(await getDatabase(), projectId);
 }
 
 export async function listProjects(): Promise<Project[]> {
