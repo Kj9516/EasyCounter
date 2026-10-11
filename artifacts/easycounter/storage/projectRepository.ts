@@ -37,6 +37,7 @@ export interface ScreenWidget {
   screenId: string;
   position: number;
   span?: 1 | 2;
+  height?: 1 | 2 | 3;
   visibleWhen?: string;
   titleExpression?: string;
   colorExpression?: string;
@@ -54,6 +55,7 @@ export interface ScreenWidgetRow {
   screen_id: string;
   position: number;
   span: number;
+  height: number;
   visible_when: string | null;
   title_expression: string | null;
   color_expression: string | null;
@@ -280,6 +282,14 @@ export async function initializeProjectDatabase(
   }
   const latestPreferencesVersion = await db.getFirstAsync<{ user_version: number }>('PRAGMA user_version;');
   if ((latestPreferencesVersion?.user_version ?? 0) < 11) throw new Error('Не удалось обновить настройки проекта до версии 11.');
+  const heightVersion = await db.getFirstAsync<{ user_version: number }>('PRAGMA user_version;');
+  if ((heightVersion?.user_version ?? 0) < 12) {
+    await db.withExclusiveTransactionAsync(async (transaction) => {
+      await transaction.execAsync('ALTER TABLE screen_widgets ADD COLUMN height INTEGER NOT NULL DEFAULT 1 CHECK(height IN (1, 2, 3)); PRAGMA user_version = 12;');
+    });
+  }
+  const latestWidgetVersion = await db.getFirstAsync<{ user_version: number }>('PRAGMA user_version;');
+  if ((latestWidgetVersion?.user_version ?? 0) < 12) throw new Error('Не удалось обновить размеры виджетов до версии 12.');
 }
 
 export async function getProjectAccessibilityLabelsEnabled(db: SQLiteDatabase, projectId: string): Promise<boolean> {
@@ -298,10 +308,10 @@ export async function setProjectAccessibilityLabelsEnabled(db: SQLiteDatabase, p
 
 export async function listScreenWidgets(db: SQLiteDatabase, projectId: string, screenId: string): Promise<ScreenWidget[]> {
   const rows = await db.getAllAsync<ScreenWidgetRow>(
-    'SELECT id, type, title, parameter_id, button_id, screen_id, position, span, visible_when, title_expression, color_expression, options_json, parent_id, accessibility_label FROM screen_widgets WHERE project_id = ? AND screen_id = ? ORDER BY position, id;',
+    'SELECT id, type, title, parameter_id, button_id, screen_id, position, span, height, visible_when, title_expression, color_expression, options_json, parent_id, accessibility_label FROM screen_widgets WHERE project_id = ? AND screen_id = ? ORDER BY position, id;',
     projectId, screenId,
   );
-  return rows.map((row) => ({ id: row.id, type: row.type, title: row.title, screenId: row.screen_id, position: row.position, span: row.span === 2 ? 2 : 1, ...(row.visible_when ? { visibleWhen: row.visible_when } : {}), ...(row.title_expression ? { titleExpression: row.title_expression } : {}), ...(row.color_expression ? { colorExpression: row.color_expression } : {}), ...(row.options_json ? { optionsJson: row.options_json } : {}), ...(row.parent_id ? { parentId: row.parent_id } : {}), ...(row.accessibility_label ? { accessibilityLabel: row.accessibility_label } : {}), ...(row.parameter_id ? { parameterId: row.parameter_id } : {}), ...(row.button_id ? { buttonId: row.button_id } : {}) }));
+  return rows.map((row) => ({ id: row.id, type: row.type, title: row.title, screenId: row.screen_id, position: row.position, span: row.span === 2 ? 2 : 1, ...(row.height > 1 ? { height: row.height as 2 | 3 } : {}), ...(row.visible_when ? { visibleWhen: row.visible_when } : {}), ...(row.title_expression ? { titleExpression: row.title_expression } : {}), ...(row.color_expression ? { colorExpression: row.color_expression } : {}), ...(row.options_json ? { optionsJson: row.options_json } : {}), ...(row.parent_id ? { parentId: row.parent_id } : {}), ...(row.accessibility_label ? { accessibilityLabel: row.accessibility_label } : {}), ...(row.parameter_id ? { parameterId: row.parameter_id } : {}), ...(row.button_id ? { buttonId: row.button_id } : {}) }));
 }
 
 export async function saveScreenWidgets(db: SQLiteDatabase, projectId: string, screenId: string, widgets: ScreenWidget[]): Promise<void> {
@@ -334,13 +344,14 @@ export async function saveScreenWidgets(db: SQLiteDatabase, projectId: string, s
       if (widget.type === 'select' && (!widget.optionsJson || JSON.parse(widget.optionsJson).length < 2)) throw new Error(`Для выбора ${widget.title} нужно указать минимум два варианта.`);
       if (['container', 'text'].includes(widget.type) && (widget.parameterId || widget.buttonId)) throw new Error(`Виджет ${widget.title} не поддерживает привязку параметра или кнопки.`);
       if (widget.span !== undefined && widget.span !== 1 && widget.span !== 2) throw new Error('Ширина виджета должна занимать одну или две колонки.');
+      if (widget.height !== undefined && widget.height !== 1 && widget.height !== 2 && widget.height !== 3) throw new Error('Высота виджета должна занимать от одной до трёх строк.');
       if (widget.optionsJson) { let options: unknown; try { options = JSON.parse(widget.optionsJson); } catch { throw new Error(`Некорректные варианты виджета ${widget.title}.`); } if (!Array.isArray(options) || options.some((option) => typeof option !== 'string')) throw new Error(`Варианты виджета ${widget.title} должны быть списком строк.`); }
     }
     await transaction.runAsync('DELETE FROM screen_widgets WHERE project_id = ? AND screen_id = ?;', projectId, screenId);
     for (const [position, widget] of widgets.entries()) {
       await transaction.runAsync(
-        'INSERT INTO screen_widgets (id, project_id, screen_id, type, title, parameter_id, button_id, position, span, visible_when, title_expression, color_expression, options_json, parent_id, accessibility_label) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);',
-        widget.id, projectId, screenId, widget.type, widget.title.trim(), widget.parameterId ?? null, widget.buttonId ?? null, position, widget.span ?? 1, widget.visibleWhen ?? null, widget.titleExpression ?? null, widget.colorExpression ?? null, widget.optionsJson ?? null, widget.parentId ?? null, widget.accessibilityLabel ?? null,
+        'INSERT INTO screen_widgets (id, project_id, screen_id, type, title, parameter_id, button_id, position, span, visible_when, title_expression, color_expression, options_json, parent_id, accessibility_label, height) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);',
+        widget.id, projectId, screenId, widget.type, widget.title.trim(), widget.parameterId ?? null, widget.buttonId ?? null, position, widget.span ?? 1, widget.visibleWhen ?? null, widget.titleExpression ?? null, widget.colorExpression ?? null, widget.optionsJson ?? null, widget.parentId ?? null, widget.accessibilityLabel ?? null, widget.height ?? 1,
       );
     }
   });
@@ -804,6 +815,7 @@ export async function importProjectArchive(db: SQLiteDatabase, input: string): P
       const title = requireName(raw.title, 'Виджет');
       if (title.length > 160) throw new Error('Название виджета длиннее 160 символов.');
       if (raw.span !== undefined && raw.span !== 1 && raw.span !== 2) throw new Error('Некорректная ширина виджета.');
+      if (raw.height !== undefined && raw.height !== 1 && raw.height !== 2 && raw.height !== 3) throw new Error('Некорректная высота виджета.');
       const parameter = parameterId ? parameterById.get(parameterId) : undefined;
       if (['value', 'indicator'].includes(type) && !parameterId) throw new Error(`Виджету «${raw.title}» нужен параметр.`);
       if (['button'].includes(type) && !buttonId) throw new Error(`Кнопке «${raw.title}» нужен ID действия.`);
@@ -831,6 +843,7 @@ export async function importProjectArchive(db: SQLiteDatabase, input: string): P
         id: widgetIds.get(raw.id)!, type, title, screenId: screens[screenIndex].id,
         position: Number.isSafeInteger(raw.position) && Number(raw.position) >= 0 ? Number(raw.position) : 0,
         span: raw.span === 2 ? 2 as const : 1 as const,
+        height: raw.height === 2 || raw.height === 3 ? raw.height as 2 | 3 : 1 as const,
         ...(parameterId ? { parameterId } : {}), ...(buttonId ? { buttonId } : {}),
         ...(remapWidgetExpression(raw.visibleWhen) ? { visibleWhen: remapWidgetExpression(raw.visibleWhen) } : {}),
         ...(remapWidgetExpression(raw.titleExpression) ? { titleExpression: remapWidgetExpression(raw.titleExpression) } : {}),
@@ -863,8 +876,8 @@ export async function importProjectArchive(db: SQLiteDatabase, input: string): P
       const screen = project.screens[index];
       await transaction.runAsync('INSERT INTO project_screens (id, project_id, name, position, created_at) VALUES (?, ?, ?, ?, ?);', screen.id, project.id, screen.name, screen.position, now);
       for (const widget of screenWidgets[index]) await transaction.runAsync(
-        'INSERT INTO screen_widgets (id, project_id, screen_id, type, title, parameter_id, button_id, position, span, visible_when, title_expression, color_expression, options_json, parent_id, accessibility_label) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);',
-        widget.id, project.id, screen.id, widget.type, widget.title.trim(), widget.parameterId ?? null, widget.buttonId ?? null, widget.position, widget.span ?? 1, widget.visibleWhen ?? null, widget.titleExpression ?? null, widget.colorExpression ?? null, widget.optionsJson ?? null, widget.parentId ?? null, widget.accessibilityLabel ?? null,
+        'INSERT INTO screen_widgets (id, project_id, screen_id, type, title, parameter_id, button_id, position, span, visible_when, title_expression, color_expression, options_json, parent_id, accessibility_label, height) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);',
+        widget.id, project.id, screen.id, widget.type, widget.title.trim(), widget.parameterId ?? null, widget.buttonId ?? null, widget.position, widget.span ?? 1, widget.visibleWhen ?? null, widget.titleExpression ?? null, widget.colorExpression ?? null, widget.optionsJson ?? null, widget.parentId ?? null, widget.accessibilityLabel ?? null, widget.height ?? 1,
       );
     }
     await transaction.runAsync('INSERT INTO project_engine_state (project_id, configuration_json, runtime_json, revision, updated_at) VALUES (?, ?, ?, ?, ?);', project.id, JSON.stringify(configuration), JSON.stringify(runtime), revision, now);
