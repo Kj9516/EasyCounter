@@ -51,6 +51,17 @@ export default function ProjectScreensIndex() {
       <Stack.Screen
         options={{
           title: project.name,
+          headerLeft: () => (
+            <Pressable
+              accessibilityRole="button"
+              accessibilityLabel="Назад к проектам"
+              hitSlop={10}
+              onPress={() => router.back()}
+              style={styles.headerAction}
+            >
+              <Feather name="arrow-left" size={20} color={colors.primary} />
+            </Pressable>
+          ),
           headerRight: () => (
             <Pressable
               accessibilityRole="button"
