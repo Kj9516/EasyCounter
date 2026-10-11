@@ -354,3 +354,11 @@ test('timer control actions start, pause, reset timers without blocking paramete
   ])]));
   assert.equal(completed(execute(state, button('timer-controls'))).state.runtime.values.Timer.value.status, 'stopped');
 });
+
+test('timers read their duration in seconds from another parameter when started or reset', () => {
+  const seconds = parameter('Seconds', 90);
+  const timer = { id: 'Timer', name: 'Timer', kind: 'stored', type: 'timer', timerDurationParameterId: 'Seconds', initialValue: { type: 'timer', value: { elapsedMilliseconds: '1000', initialMilliseconds: '1000', direction: 'down', status: 'stopped', allowNegative: false } } };
+  const result = completed(execute(createInitialProjectState(config([seconds, timer], [rule('start', { type: 'button', id: 'start' }, [{ type: 'timerControl', parameterId: 'Timer', command: 'start' }])])), button('start')));
+  assert.equal(result.state.runtime.values.Timer.value.elapsedMilliseconds, '90000');
+  assert.equal(result.state.runtime.values.Timer.value.initialMilliseconds, '90000');
+});

@@ -347,7 +347,16 @@ export function execute(
       if (action.command === 'start' && before.value.status === 'running') return;
       if (action.command === 'pause' && before.value.status !== 'running') return;
       const now = Date.now();
-      const timer = before.value;
+      let timer = before.value;
+      const alreadyBelowZero = timer.allowNegative && BigInt(timer.elapsedMilliseconds) < 0n;
+      if ((action.command === 'reset' || (action.command === 'start' && timer.status === 'stopped' && !alreadyBelowZero)) && parameter.timerDurationParameterId) {
+        const sourceValue = runtime.values[parameter.timerDurationParameterId];
+        if (!sourceValue || (sourceValue.type !== 'integer' && sourceValue.type !== 'decimal')) throw new Error('Timer duration source must contain a number of seconds');
+        const duration = Decimal.parse(sourceValue.value).mul(Decimal.parse('1000'));
+        if (duration.scale !== 0 || duration.coefficient < 0n) throw new Error('Timer duration must be a non-negative number of seconds with millisecond precision');
+        const milliseconds = duration.toString();
+        timer = { ...timer, elapsedMilliseconds: milliseconds, initialMilliseconds: milliseconds };
+      }
       let elapsed = BigInt(timer.elapsedMilliseconds);
       if (timer.status === 'running' && timer.startedAt !== undefined) {
         const passed = BigInt(Math.max(0, now - timer.startedAt));
@@ -358,7 +367,6 @@ export function execute(
       switch (action.command) {
         case 'start':
           if (timer.status !== 'running') {
-            const alreadyBelowZero = timer.allowNegative && BigInt(timer.elapsedMilliseconds) < 0n;
             nextTimer = { ...nextTimer, status: 'running', startedAt: now, completionNotified: timer.status === 'stopped' && !alreadyBelowZero ? false : timer.completionNotified };
           }
           break;

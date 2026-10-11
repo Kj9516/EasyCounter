@@ -47,6 +47,8 @@ interface ParameterBase {
 
 export interface StoredParameter extends ParameterBase {
   kind: 'stored';
+  /** Optional numeric parameter whose current value in seconds is loaded by timer start/reset. */
+  timerDurationParameterId?: string;
 }
 
 export interface ComputedParameter extends ParameterBase {

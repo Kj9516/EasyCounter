@@ -758,7 +758,7 @@ export async function importProjectArchive(db: SQLiteDatabase, input: string): P
     if (typeof widget.id === 'string' && widget.id) widgetIds.set(widget.id, makeId());
   }
   const configuration: ProjectConfiguration = {
-    parameters: archive.configuration.parameters.map((parameter) => ({ ...parameter, id: parameterIds.get(parameter.id)!, ...(parameter.kind === 'computed' ? { formula: remapExpression(parameter.formula, parameterIds) } : {}) })),
+    parameters: archive.configuration.parameters.map((parameter) => ({ ...parameter, id: parameterIds.get(parameter.id)!, ...(parameter.kind === 'computed' ? { formula: remapExpression(parameter.formula, parameterIds) } : parameter.timerDurationParameterId ? { timerDurationParameterId: parameterIds.get(parameter.timerDurationParameterId) ?? parameter.timerDurationParameterId } : {}) })),
     rules: archive.configuration.rules.map((rule) => ({
       ...rule,
       id: ruleIds.get(rule.id)!,
