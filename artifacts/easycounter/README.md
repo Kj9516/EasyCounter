@@ -67,14 +67,14 @@ pnpm exec expo export --platform android
 Для локального Expo Go запуска:
 
 ```bash
-pnpm exec expo start --lan
+pnpm run start:device
 ```
 
 Телефон и компьютер должны быть в одной сети. Если LAN-соединение недоступно, настройте Expo tunnel и затем сканируйте QR-код в Expo Go.
 
 ## Ручная приемка на телефоне
 
-В Replit запустите workflow **EasyCounter / expo** и откройте QR из его консоли/предпросмотра. На iPhone установите Expo Go и отсканируйте QR штатной камерой; на Android откройте сканер QR в Expo Go. Не используйте web-превью как подтверждение нативного запуска.
+Эти инструкции находятся в отдельной ветке `expo-stage-d-acceptance`. Из папки `artifacts/easycounter` запустите `pnpm run start:device`; на iPhone отсканируйте QR штатной камерой, на Android — сканером Expo Go. Компьютер и устройство должны быть в одной сети. Если LAN-соединение недоступно, настройте Expo tunnel. Не используйте web-превью как подтверждение нативного запуска.
 
 Проверьте и зафиксируйте результат каждого шага для этапа A, а затем сценарии этапа C в [`docs/device-acceptance.md`](docs/device-acceptance.md):
 
