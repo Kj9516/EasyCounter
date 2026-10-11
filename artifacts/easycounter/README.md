@@ -71,7 +71,7 @@ pnpm exec expo export --platform android
 Expo Go/проверка на iPhone настроена в отдельной ветке `iphone-ux-review`; на `main` остаются только продуктовые изменения. Переключитесь на эту ветку, затем для запуска:
 
 ```bash
-pnpm exec expo start --lan
+pnpm run start:device
 ```
 
 Телефон и компьютер должны быть в одной сети. Если LAN-соединение недоступно, настройте Expo tunnel и затем сканируйте QR-код в Expo Go.
