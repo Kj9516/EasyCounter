@@ -1,7 +1,7 @@
 import * as SQLite from 'expo-sqlite';
 import type { Project, ProjectDraft, ProjectScreen } from '../types/project';
 import type { ExecutionResult, ProjectConfiguration, ProjectState } from '../engine/types';
-import type { OperationHistoryEntry, ScreenWidget } from './projectRepository';
+import type { OperationHistoryEntry, ProjectArchive, ScreenWidget } from './projectRepository';
 import {
   createProject as insertProject,
   createProjectScreen as insertProjectScreen,
@@ -21,6 +21,8 @@ import {
   updateProject as updateStoredProject,
   getProjectAccessibilityLabelsEnabled as readProjectAccessibilityLabelsEnabled,
   setProjectAccessibilityLabelsEnabled as storeProjectAccessibilityLabelsEnabled,
+  exportProjectArchive as readProjectArchive,
+  importProjectArchive as createImportedProject,
 } from './projectRepository';
 
 const DATABASE_NAME = 'easycounter.db';
@@ -82,6 +84,14 @@ export async function getProjectAccessibilityLabelsEnabled(projectId: string): P
 
 export async function setProjectAccessibilityLabelsEnabled(projectId: string, enabled: boolean): Promise<void> {
   return storeProjectAccessibilityLabelsEnabled(await getDatabase(), projectId, enabled);
+}
+
+export async function exportProjectArchive(projectId: string, kind: 'template' | 'full', includeHistory = false): Promise<ProjectArchive> {
+  return readProjectArchive(await getDatabase(), projectId, kind, includeHistory);
+}
+
+export async function importProjectArchive(input: string): Promise<Project> {
+  return createImportedProject(await getDatabase(), input);
 }
 
 export async function listProjects(): Promise<Project[]> {

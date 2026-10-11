@@ -3,7 +3,7 @@ const { test } = require('node:test');
 const {
   Decimal, EngineExecutionError, ConfigurationValidationError, execute,
   createInitialProjectState, parseExpression, validateProjectConfiguration,
-  resetParameters,
+  resetParameters, dueScheduleEvents,
 } = require('../.test-build/engine/index.js');
 
 const integer = (value) => ({ type: 'integer', value: String(value) });
@@ -304,4 +304,53 @@ test('input action rejects computed, list, and timer parameters during configura
   assert.throws(() => validateProjectConfiguration(config([parameter('A', 0), { ...parameter('C', 0), kind: 'computed', formula: literal(0) }], [rule('computed', { type: 'button', id: 'go' }, [{ type: 'input', parameterId: 'C', prompt: '?' }])])), /read-only/);
   assert.throws(() => validateProjectConfiguration(config([list], [rule('list', { type: 'button', id: 'go' }, [{ type: 'input', parameterId: 'Items', prompt: '?' }])])), /not supported for list/);
   assert.throws(() => validateProjectConfiguration(config([timer], [rule('timer', { type: 'button', id: 'go' }, [{ type: 'input', parameterId: 'Timer', prompt: '?' }])])), /not supported for timer/);
+});
+
+test('periodic scheduler restores all, latest-only, or skipped missed intervals', () => {
+  const anchor = Date.parse('2026-01-01T00:00:00.000Z');
+  const state = createInitialProjectState(config([], ['all', 'once', 'skip'].map((missedPolicy) => rule(missedPolicy, {
+    type: 'periodic', intervalMilliseconds: '300000', anchorAt: new Date(anchor).toISOString(), missedPolicy,
+  }, []))));
+  const events = dueScheduleEvents(state, anchor + 20 * 60_000);
+  assert.deepEqual(events.filter((event) => event.ruleId === 'all').map((event) => event.occurredAt), [
+    5, 10, 15, 20,
+  ].map((minute) => new Date(anchor + minute * 60_000).toISOString()));
+  assert.equal(events.find((event) => event.ruleId === 'once').occurredAt, new Date(anchor + 20 * 60_000).toISOString());
+  assert.equal(events.find((event) => event.ruleId === 'skip').skipped, true);
+});
+
+test('calendar scheduler handles local daily time and daylight-saving gaps and overlap', () => {
+  const makeState = (localTime, anchorAt) => createInitialProjectState(config([], [rule('daily', {
+    type: 'calendar', recurrence: 'daily', localTime, timeZone: 'America/New_York', anchorAt,
+    missedPolicy: 'all',
+  }, [])]));
+  const springAnchor = '2026-03-07T00:00:00.000Z';
+  const springState = makeState('02:30', springAnchor);
+  const spring = dueScheduleEvents(springState, Date.parse('2026-03-09T12:00:00.000Z'));
+  assert.deepEqual(spring.map((event) => event.occurredAt), ['2026-03-07T07:30:00.000Z', '2026-03-09T06:30:00.000Z']);
+  const fallState = makeState('01:30', '2026-11-01T00:00:00.000Z');
+  const fall = dueScheduleEvents(fallState, Date.parse('2026-11-01T12:00:00.000Z'));
+  assert.deepEqual(fall.map((event) => event.occurredAt), ['2026-11-01T05:30:00.000Z']);
+});
+
+test('schedule event commits its cursor once and runs the matching rule', () => {
+  const anchorAt = '2026-01-01T00:00:00.000Z';
+  const state = createInitialProjectState(config([parameter('N', 0)], [rule('tick', {
+    type: 'periodic', intervalMilliseconds: '1000', anchorAt, missedPolicy: 'all',
+  }, [{ type: 'add', parameterId: 'N', expression: literal(1) }])]));
+  const due = dueScheduleEvents(state, Date.parse(anchorAt) + 1000)[0];
+  const result = completed(execute(state, { type: 'scheduleTick', sourceId: due.ruleId, occurredAt: due.occurredAt, skipped: due.skipped }));
+  assert.equal(result.state.runtime.values.N.value, '1');
+  assert.equal(result.state.runtime.scheduleCursors.tick, due.occurredAt);
+  assert.throws(() => execute(result.state, { type: 'scheduleTick', sourceId: due.ruleId, occurredAt: due.occurredAt }), /already processed/);
+});
+
+test('timer control actions start, pause, reset timers without blocking parameter visibility', () => {
+  const timer = { id: 'Timer', name: 'Timer', kind: 'stored', type: 'timer', initialValue: { type: 'timer', value: { elapsedMilliseconds: '100000', initialMilliseconds: '100000', direction: 'down', status: 'stopped', allowNegative: false } } };
+  const state = createInitialProjectState(config([timer], [rule('control', { type: 'button', id: 'timer-controls' }, [
+    { type: 'timerControl', parameterId: 'Timer', command: 'start' },
+    { type: 'timerControl', parameterId: 'Timer', command: 'pause' },
+    { type: 'timerControl', parameterId: 'Timer', command: 'reset' },
+  ])]));
+  assert.equal(completed(execute(state, button('timer-controls'))).state.runtime.values.Timer.value.status, 'stopped');
 });

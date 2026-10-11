@@ -18,7 +18,11 @@ export interface TimerValue {
   status: 'running' | 'paused' | 'stopped';
   allowNegative: boolean;
   startedAt?: number;
+  /** Set after the zero crossing event has been committed. */
+  completionNotified?: boolean;
 }
+
+export type TimerCommand = 'start' | 'pause' | 'stop' | 'reset';
 
 export type ScalarValue =
   | { type: 'integer' | 'decimal' | 'duration'; value: string }
@@ -72,6 +76,7 @@ export type Expr =
 export type Action =
   | { type: 'message'; text: string }
   | { type: 'input'; parameterId?: string; variableName?: string; variableType?: ScalarType; prompt: string }
+  | { type: 'timerControl'; parameterId: string; command: TimerCommand }
   | { type: 'set'; parameterId: string; expression: Expr }
   | { type: 'add'; parameterId: string; expression: Expr }
   | { type: 'listAdd'; parameterId: string; expression: Expr }
@@ -80,7 +85,9 @@ export type Action =
 
 export type EventSource =
   | { type: 'button'; id: string }
-  | { type: 'changed' | 'assigned'; parameterId: string };
+  | { type: 'changed' | 'assigned' | 'timerFinished'; parameterId: string }
+  | { type: 'periodic'; intervalMilliseconds: string; anchorAt: string; missedPolicy: 'all' | 'once' | 'skip' }
+  | { type: 'calendar'; recurrence: 'daily' | 'weekly' | 'once'; localTime: string; dayOfWeek?: number; date?: string; timeZone: string; anchorAt: string; missedPolicy: 'all' | 'once' | 'skip' };
 
 export interface Rule {
   id: string;
@@ -103,6 +110,8 @@ export interface RuntimeState {
   values: Record<string, Value>;
   /** Last evaluated truth value for each rising-edge rule. */
   ruleTruth: Record<string, boolean>;
+  /** Last committed occurrence for each periodic/calendar rule. */
+  scheduleCursors?: Record<string, string>;
 }
 
 export interface ProjectState {
@@ -113,13 +122,14 @@ export interface ProjectState {
 }
 
 export interface EngineEvent {
-  type: 'button' | 'changed' | 'assigned' | 'reset';
+  type: 'button' | 'changed' | 'assigned' | 'reset' | 'timerFinished' | 'scheduleTick';
   sourceId: string;
   occurredAt?: string;
   oldValue?: Value;
   newValue?: Value;
   parameterIds?: string[];
   messages?: string[];
+  skipped?: boolean;
 }
 
 export interface Change {

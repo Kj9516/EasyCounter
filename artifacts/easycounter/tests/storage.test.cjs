@@ -245,7 +245,7 @@ test('migrates an existing version 1 project to the engine tables', async () => 
   try {
     const state = await repository.loadProjectEngineState(migrated, 'legacy');
     assert.deepEqual(state.config, { parameters: [], rules: [] });
-    assert.equal((await migrated.getFirstAsync('PRAGMA user_version;')).user_version, 10);
+    assert.equal((await migrated.getFirstAsync('PRAGMA user_version;')).user_version, 11);
     assert.equal(await migrated.getFirstAsync("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'screen_widgets';") !== null, true);
   } finally {
     migrated.close();
@@ -341,4 +341,46 @@ test('waiting input is not persisted until response completes the operation', as
   assert.equal((await repository.loadProjectEngineState(database, project.id)).runtime.values.Count.value, '14');
   const [entry] = await repository.listProjectOperationHistory(database, project.id);
   assert.deepEqual(entry.changes.map((change) => [change.oldValue.value, change.newValue.value]), [['0', '5'], ['5', '14']]);
+});
+
+test('template and full project archives import as independent copies with remapped references', async () => {
+  const source = await repository.createProject(database, { name: 'Archive source', description: 'Portable' });
+  const [screen] = source.screens;
+  const configuration = {
+    parameters: [{ id: 'count', name: 'Count', kind: 'stored', type: 'integer', initialValue: { type: 'integer', value: '0' } }],
+    rules: [{ id: 'rule-add', name: 'Add', enabled: true, order: 0, triggerMode: 'each', eventSource: { type: 'button', id: 'button-add' }, actions: [{ type: 'add', parameterId: 'count', expression: { kind: 'literal', value: { type: 'integer', value: '1' } } }] }],
+  };
+  await repository.saveProjectEngineConfiguration(database, source.id, configuration);
+  await repository.saveScreenWidgets(database, source.id, screen.id, [
+    { id: 'widget-value', type: 'value', title: 'Count', parameterId: 'count', screenId: screen.id, position: 0 },
+    { id: 'widget-button', type: 'button', title: 'Add', buttonId: 'button-add', screenId: screen.id, position: 1 },
+  ]);
+  const operation = engine.execute(await repository.loadProjectEngineState(database, source.id), { type: 'button', sourceId: 'button-add' });
+  await repository.commitEngineExecution(database, source.id, operation);
+
+  const fullArchive = await repository.exportProjectArchive(database, source.id, 'full', true);
+  const imported = await repository.importProjectArchive(database, JSON.stringify(fullArchive));
+  assert.notEqual(imported.id, source.id);
+  const copiedState = await repository.loadProjectEngineState(database, imported.id);
+  assert.equal(copiedState.runtime.values[copiedState.config.parameters[0].id].value, '1');
+  assert.equal(copiedState.config.rules[0].actions[0].parameterId, copiedState.config.parameters[0].id);
+  const copiedWidgets = await repository.listScreenWidgets(database, imported.id, imported.screens[0].id);
+  assert.equal(copiedWidgets[0].parameterId, copiedState.config.parameters[0].id);
+  assert.notEqual(copiedWidgets[0].id, 'widget-value');
+  assert.equal(copiedWidgets[1].buttonId, copiedState.config.rules[0].eventSource.id);
+  assert.equal((await repository.listProjectOperationHistory(database, imported.id)).length, 1);
+
+  const template = await repository.exportProjectArchive(database, source.id, 'template', false);
+  const templateCopy = await repository.importProjectArchive(database, JSON.stringify(template));
+  const templateState = await repository.loadProjectEngineState(database, templateCopy.id);
+  assert.equal(templateState.runtime.values[templateState.config.parameters[0].id].value, '0');
+  assert.equal((await repository.listProjectOperationHistory(database, templateCopy.id)).length, 0);
+  assert.equal((await repository.listProjects(database)).length, 3);
+});
+
+test('rejects malformed and oversized project archives without creating partial projects', async () => {
+  const existing = await repository.listProjects(database);
+  await assert.rejects(repository.importProjectArchive(database, '{broken json'), /корректным JSON/);
+  await assert.rejects(repository.importProjectArchive(database, ' '.repeat(5_000_001)), /5 МБ/);
+  assert.equal((await repository.listProjects(database)).length, existing.length);
 });

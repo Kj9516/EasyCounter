@@ -57,7 +57,7 @@ function copyConfig(config: ProjectConfiguration): ProjectConfiguration {
 }
 
 function copyAction(action: Action): Action {
-  if (action.type === 'message' || action.type === 'input') return { ...action };
+  if (action.type === 'message' || action.type === 'input' || action.type === 'timerControl') return { ...action };
   if (action.type === 'listRemove') return { ...action, index: copyExpression(action.index) };
   if (action.type === 'listReplace') {
     return { ...action, index: copyExpression(action.index), expression: copyExpression(action.expression) };
@@ -66,7 +66,10 @@ function copyAction(action: Action): Action {
 }
 
 function matching(event: EngineEvent, rule: Rule): boolean {
+  if (event.skipped) return false;
   if (event.type === 'button') return rule.eventSource.type === 'button' && rule.eventSource.id === event.sourceId;
+  if (event.type === 'timerFinished') return rule.eventSource.type === 'timerFinished' && rule.eventSource.parameterId === event.sourceId;
+  if (event.type === 'scheduleTick') return rule.id === event.sourceId && (rule.eventSource.type === 'periodic' || rule.eventSource.type === 'calendar');
   return (event.type === 'changed' || event.type === 'assigned')
     && rule.eventSource.type === event.type
     && rule.eventSource.parameterId === event.sourceId;
@@ -116,6 +119,7 @@ export function execute(
   const runtime: RuntimeState = {
     values: Object.fromEntries(Object.entries(baseState.runtime.values).map(([id, value]) => [id, copyValue(value)])),
     ruleTruth: { ...baseState.runtime.ruleTruth },
+    scheduleCursors: { ...(baseState.runtime.scheduleCursors ?? {}) },
   };
   const parameters = new Map(config.parameters.map((parameter) => [parameter.id, parameter] as const));
   const localValues = new Map<string, Value>();
@@ -140,6 +144,7 @@ export function execute(
   let ruleIndex = 0;
   let actionIndex = 0;
   let selectedRule = false;
+  let rootApplied = false;
   let cancelled = false;
   let pendingInput: { parameterId?: string; variableName?: string; variableType?: import('./types').ScalarType; prompt: string; ruleId: string; ruleName: string } | undefined;
 
@@ -286,6 +291,37 @@ export function execute(
     applyChange(parameter, next, null, rootEvent.occurredAt!);
   }
 
+  function applyRootTimerFinished(): void {
+    if (rootEvent.type !== 'timerFinished') return;
+    const parameter = parameters.get(rootEvent.sourceId);
+    const current = parameter ? runtime.values[parameter.id] : undefined;
+    if (!parameter || parameter.kind !== 'stored' || parameter.type !== 'timer' || current?.type !== 'timer') throw new Error('Timer completion requires a stored timer parameter');
+    if (current.value.status !== 'running' || current.value.direction !== 'down' || current.value.startedAt === undefined || current.value.completionNotified) throw new Error('Timer is no longer waiting to finish');
+    const finishAt = current.value.startedAt + Number(BigInt(current.value.elapsedMilliseconds));
+    const remaining = BigInt(current.value.elapsedMilliseconds) - BigInt(Math.max(0, Date.now() - current.value.startedAt));
+    if (remaining > 0n) throw new Error('Timer has not reached zero');
+    const occurredAt = new Date(finishAt).toISOString();
+    rootEvent.occurredAt = occurredAt;
+    rootEvent.oldValue = copyValue(current);
+    const completed: Value = { type: 'timer', value: current.value.allowNegative
+      ? { ...current.value, elapsedMilliseconds: '0', startedAt: finishAt, completionNotified: true }
+      : { elapsedMilliseconds: '0', initialMilliseconds: current.value.initialMilliseconds, direction: current.value.direction, status: 'stopped', allowNegative: false, completionNotified: true } };
+    rootEvent.newValue = copyValue(completed);
+    applyChange(parameter, completed, null, occurredAt);
+  }
+
+  function applyRootScheduleTick(): void {
+    if (rootEvent.type !== 'scheduleTick') return;
+    const rule = config.rules.find((item) => item.id === rootEvent.sourceId);
+    if (!rule || (rule.eventSource.type !== 'periodic' && rule.eventSource.type !== 'calendar')) throw new Error('Scheduled event requires a periodic or calendar rule');
+    const occurredAt = Date.parse(rootEvent.occurredAt!);
+    if (!Number.isFinite(occurredAt)) throw new Error('Scheduled event has an invalid occurrence time');
+    const previous = Date.parse(runtime.scheduleCursors?.[rule.id] ?? '');
+    if (Number.isFinite(previous) && occurredAt <= previous) throw new Error('Scheduled event was already processed');
+    runtime.scheduleCursors ??= {};
+    runtime.scheduleCursors[rule.id] = new Date(occurredAt).toISOString();
+  }
+
   function evaluateCondition(rule: Rule, event: EngineEvent): boolean {
     if (!rule.condition) return true;
     const result = evaluate(rule.condition, evaluationValues(), event);
@@ -306,6 +342,39 @@ export function execute(
     if (parameter.kind === 'computed') throw new Error(`Computed parameter ${parameter.id} is read-only`);
     const before = runtime.values[parameter.id];
     if (!before) throw new Error(`Parameter ${parameter.id} has no runtime value`);
+    if (action.type === 'timerControl') {
+      if (parameter.type !== 'timer' || before.type !== 'timer') throw new Error('Timer commands require a timer parameter');
+      if (action.command === 'start' && before.value.status === 'running') return;
+      if (action.command === 'pause' && before.value.status !== 'running') return;
+      const now = Date.now();
+      const timer = before.value;
+      let elapsed = BigInt(timer.elapsedMilliseconds);
+      if (timer.status === 'running' && timer.startedAt !== undefined) {
+        const passed = BigInt(Math.max(0, now - timer.startedAt));
+        elapsed = timer.direction === 'down' ? elapsed - passed : elapsed + passed;
+        if (!timer.allowNegative && elapsed < 0n) elapsed = 0n;
+      }
+      let nextTimer = { ...timer, elapsedMilliseconds: elapsed.toString() };
+      switch (action.command) {
+        case 'start':
+          if (timer.status !== 'running') {
+            const alreadyBelowZero = timer.allowNegative && BigInt(timer.elapsedMilliseconds) < 0n;
+            nextTimer = { ...nextTimer, status: 'running', startedAt: now, completionNotified: timer.status === 'stopped' && !alreadyBelowZero ? false : timer.completionNotified };
+          }
+          break;
+        case 'pause':
+          nextTimer = { ...nextTimer, status: 'paused', startedAt: undefined };
+          break;
+        case 'stop':
+          nextTimer = { ...nextTimer, status: 'stopped', startedAt: undefined };
+          break;
+        case 'reset':
+          nextTimer = { ...nextTimer, elapsedMilliseconds: timer.initialMilliseconds, status: 'stopped', startedAt: undefined, completionNotified: false };
+          break;
+      }
+      applyChange(parameter, { type: 'timer', value: nextTimer }, rule.id, new Date(now).toISOString());
+      return;
+    }
     const values = evaluationValues();
     const evaluated = action.type === 'listRemove' ? undefined : evaluate(action.expression, currentValues(runtime), event, localValues);
     const at = new Date().toISOString();
@@ -348,9 +417,12 @@ export function execute(
     let actionsRun = 0;
 
     try {
-      if (eventIndex === 0 && processedEvents.length === 0) {
+      if (!rootApplied) {
         if (rootEvent.type === 'reset') applyReset();
         if (rootEvent.type === 'assigned') applyRootAssignment();
+        if (rootEvent.type === 'timerFinished') applyRootTimerFinished();
+        if (rootEvent.type === 'scheduleTick') applyRootScheduleTick();
+        rootApplied = true;
       }
       while (eventIndex < queue.length) {
         const event = queue[eventIndex];
@@ -368,12 +440,12 @@ export function execute(
         let conditionMet = false;
         if (!selectedRule) {
           try {
-            if (rule.triggerMode === 'risingEdge') {
+            if (rule.triggerMode === 'risingEdge' && isMatch) {
               const previous = runtime.ruleTruth[rule.id] ?? false;
               const current = evaluateCondition(rule, event);
               runtime.ruleTruth[rule.id] = current;
               conditionMet = !previous && current;
-            } else if (isMatch) {
+            } else if (rule.triggerMode === 'each' && isMatch) {
               conditionMet = evaluateCondition(rule, event);
             }
           } catch (error) {

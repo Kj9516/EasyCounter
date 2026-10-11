@@ -80,11 +80,19 @@ export function canonicalizeValue(value: Value, expectedType?: PrimitiveType, li
     case 'timer': {
       if (!durationPattern.test(value.value.elapsedMilliseconds)
         || !durationPattern.test(value.value.initialMilliseconds)
+        || value.value.elapsedMilliseconds.length > 1000
+        || value.value.initialMilliseconds.length > 1000
         || !Number.isSafeInteger(value.value.startedAt ?? 0)
-        || typeof value.value.allowNegative !== 'boolean') {
+        || typeof value.value.allowNegative !== 'boolean'
+        || !['up', 'down'].includes(value.value.direction)
+        || !['running', 'paused', 'stopped'].includes(value.value.status)
+        || (value.value.completionNotified !== undefined && typeof value.value.completionNotified !== 'boolean')
+        || BigInt(value.value.initialMilliseconds) < 0n
+        || (BigInt(value.value.elapsedMilliseconds) < 0n && (!value.value.allowNegative || value.value.direction !== 'down'))) {
         throw new Error('Invalid timer state');
       }
-      return { type: 'timer', value: { ...value.value } };
+      if (value.value.status === 'running' && value.value.startedAt === undefined) throw new Error('A running timer requires a start time');
+      return { type: 'timer', value: { ...value.value, elapsedMilliseconds: BigInt(value.value.elapsedMilliseconds).toString(), initialMilliseconds: BigInt(value.value.initialMilliseconds).toString() } };
     }
     case 'list': {
       if (expectedType && expectedType !== 'list') throw new Error(`Type mismatch: expected ${expectedType}, got list`);
@@ -306,7 +314,8 @@ export function valueEquals(left: Value, right: Value): boolean {
       && left.value.direction === right.value.direction
       && left.value.status === right.value.status
       && left.value.allowNegative === right.value.allowNegative
-      && left.value.startedAt === right.value.startedAt;
+      && left.value.startedAt === right.value.startedAt
+      && left.value.completionNotified === right.value.completionNotified;
   }
   return left.value === right.value;
 }

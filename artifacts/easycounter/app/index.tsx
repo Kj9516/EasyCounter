@@ -1,10 +1,14 @@
 import { Feather } from '@expo/vector-icons';
+import * as DocumentPicker from 'expo-document-picker';
+import { File, Paths } from 'expo-file-system';
 import { router, Stack } from 'expo-router';
-import { useMemo } from 'react';
+import * as Sharing from 'expo-sharing';
+import { useMemo, useState } from 'react';
 import {
   ActivityIndicator,
   Alert,
   FlatList,
+  Modal,
   Pressable,
   RefreshControl,
   StyleSheet,
@@ -15,6 +19,7 @@ import { SafeAreaView } from 'react-native-safe-area-context';
 import { AppButton } from '@/components/AppButton';
 import { useProjects } from '@/components/ProjectProvider';
 import { useColors } from '@/hooks/useColors';
+import { exportProjectArchive, importProjectArchive } from '@/storage/database';
 import type { Project } from '@/types/project';
 
 function formatDate(value: string): string {
@@ -26,6 +31,8 @@ function formatDate(value: string): string {
 
 export default function ProjectsHomeScreen() {
   const colors = useColors();
+  const [showImport, setShowImport] = useState(false);
+  const [transferring, setTransferring] = useState(false);
   const {
     projects,
     isLoading,
@@ -54,6 +61,46 @@ export default function ProjectsHomeScreen() {
         },
       ],
     );
+  };
+
+  const shareProject = async (project: Project, kind: 'template' | 'full', includeHistory = false) => {
+    try {
+      setTransferring(true);
+      const archive = await exportProjectArchive(project.id, kind, includeHistory);
+      const file = new File(Paths.cache, `easycounter-${Date.now()}.json`);
+      file.create({ overwrite: true });
+      file.write(JSON.stringify(archive));
+      await Sharing.shareAsync(file.uri, { mimeType: 'application/json', UTI: 'public.json', dialogTitle: `${project.name} · EasyCounter` });
+    } catch (error) {
+      Alert.alert('Не удалось экспортировать проект', error instanceof Error ? error.message : String(error));
+    } finally { setTransferring(false); }
+  };
+
+  const chooseExport = (project: Project) => Alert.alert('Экспорт проекта', 'Выберите содержимое.', [
+    { text: 'Шаблон · без текущих значений', onPress: () => void shareProject(project, 'template') },
+    { text: 'Полная копия', onPress: () => Alert.alert('История операций', 'Добавить историю в экспортируемый файл?', [
+      { text: 'С историей', onPress: () => void shareProject(project, 'full', true) },
+      { text: 'Без истории', onPress: () => void shareProject(project, 'full') },
+      { text: 'Отмена', style: 'cancel' },
+    ]) },
+    { text: 'Отмена', style: 'cancel' },
+  ]);
+
+  const importProjectFile = async () => {
+    if (transferring) return;
+    try {
+      setTransferring(true);
+      const result = await DocumentPicker.getDocumentAsync({ type: ['application/json', 'public.json'], copyToCacheDirectory: true, multiple: false });
+      if (result.canceled) return;
+      const asset = result.assets[0];
+      if (asset.size !== undefined && asset.size > 5_000_000) throw new Error('Файл импорта превышает допустимый размер 5 МБ.');
+      const contents = await new File(asset.uri).text();
+      const project = await importProjectArchive(contents);
+      setShowImport(false); await refresh();
+      Alert.alert('Проект импортирован', `Создана независимая копия «${project.name}».`);
+    } catch (error) {
+      Alert.alert('Не удалось импортировать проект', error instanceof Error ? error.message : String(error));
+    } finally { setTransferring(false); }
   };
 
   const renderProject = ({ item }: { item: Project }) => (
@@ -111,6 +158,10 @@ export default function ProjectsHomeScreen() {
           <Feather name="copy" size={16} color={colors.mutedForeground} />
           <Text style={[styles.actionText, { color: colors.mutedForeground }]}>Копия</Text>
         </Pressable>
+        <Pressable accessibilityRole="button" accessibilityLabel={`Экспортировать проект ${item.name}`} onPress={() => chooseExport(item)} hitSlop={8} style={styles.iconAction}>
+          <Feather name="share" size={16} color={colors.mutedForeground} />
+          <Text style={[styles.actionText, { color: colors.mutedForeground }]}>Экспорт</Text>
+        </Pressable>
         <Pressable
           accessibilityRole="button"
           accessibilityLabel={`Удалить проект ${item.name}`}
@@ -160,6 +211,7 @@ export default function ProjectsHomeScreen() {
               onPress={() => router.push('/projects/new')}
               testID="new-project"
             />
+            <AppButton title="Импорт проекта" icon="download" variant="secondary" onPress={() => setShowImport(true)} disabled={transferring} />
             <View style={styles.sectionHeading}>
               <Text style={[styles.sectionTitle, { color: colors.foreground }]}>Ваши проекты</Text>
               <Text style={[styles.count, { color: colors.mutedForeground }]}>
@@ -191,6 +243,14 @@ export default function ProjectsHomeScreen() {
         ItemSeparatorComponent={() => <View style={{ height: 12 }} />}
         ListFooterComponent={<View style={{ height: 26 }} />}
       />
+      <Modal visible={showImport} transparent animationType="slide" onRequestClose={() => setShowImport(false)}>
+        <View style={styles.importBackdrop}><View style={[styles.importCard, { backgroundColor: colors.card }]}>
+          <Text style={[styles.sectionTitle, { color: colors.foreground }]}>Импорт проекта</Text>
+          <Text style={[styles.projectMeta, { color: colors.mutedForeground }]}>Выберите файл проекта EasyCounter в формате JSON. Будет создана независимая копия.</Text>
+          <AppButton title={transferring ? 'Открываем файл…' : 'Выбрать файл JSON'} icon="file-plus" onPress={() => void importProjectFile()} disabled={transferring} />
+          <AppButton title="Отмена" variant="quiet" onPress={() => setShowImport(false)} />
+        </View></View>
+      </Modal>
     </SafeAreaView>
   );
 }
@@ -215,6 +275,8 @@ const styles = StyleSheet.create({
   projectDescription: { fontFamily: 'Inter_400Regular', fontSize: 13, lineHeight: 18, marginTop: 3 },
   cardActions: { borderTopWidth: StyleSheet.hairlineWidth, minHeight: 43, paddingHorizontal: 15, flexDirection: 'row', alignItems: 'center', gap: 20 },
   iconAction: { flexDirection: 'row', alignItems: 'center', gap: 6, minHeight: 38 },
+  importBackdrop: { flex: 1, backgroundColor: '#0008', justifyContent: 'center', padding: 20 },
+  importCard: { borderRadius: 18, padding: 17, gap: 12, maxHeight: '90%' },
   actionText: { fontFamily: 'Inter_500Medium', fontSize: 12 },
   emptyState: { padding: 20, borderWidth: 1, borderRadius: 22, alignItems: 'flex-start', gap: 10 },
   emptyIcon: { width: 46, height: 46, borderRadius: 16, alignItems: 'center', justifyContent: 'center' },

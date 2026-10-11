@@ -1,13 +1,13 @@
 import { Feather } from '@expo/vector-icons';
 import { router, Stack, useFocusEffect, useLocalSearchParams } from 'expo-router';
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { ActivityIndicator, Alert, Modal, Pressable, ScrollView, StyleSheet, Text, TextInput, View } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { AppButton } from '@/components/AppButton';
 import { ExpressionComposer } from '@/components/ExpressionComposer';
 import { useProjects } from '@/components/ProjectProvider';
 import { useColors } from '@/hooks/useColors';
-import { Decimal, evaluate, execute, parseExpression } from '@/engine';
+import { Decimal, dueScheduleEvents, evaluate, execute, parseExpression } from '@/engine';
 import type { ProjectState, Value } from '@/engine';
 import { commitEngineExecution, getProjectAccessibilityLabelsEnabled, listScreenWidgets, loadProjectEngineState, saveProjectEngineConfiguration, saveScreenWidgets } from '@/storage/database';
 import type { ScreenWidget } from '@/storage/projectRepository';
@@ -21,6 +21,10 @@ export default function ProjectScreenWorkspace() {
   const project = projects.find((item) => item.id === projectId);
   const screen = project?.screens.find((item) => item.id === screenId);
   const [state, setState] = useState<ProjectState | null>(null);
+  const [clockNow, setClockNow] = useState(() => Date.now());
+  const timerFinishesInFlight = useRef(new Set<string>());
+  const failedBackgroundEvents = useRef(new Map<string, number>());
+  const pendingBackgroundKey = useRef<string | null>(null);
   const [widgets, setWidgets] = useState<ScreenWidget[]>([]);
   const [working, setWorking] = useState(false);
   const [editMode, setEditMode] = useState(true);
@@ -46,6 +50,57 @@ export default function ProjectScreenWorkspace() {
   }, [projectId, screenId]);
   useEffect(() => { void refresh().catch((error: unknown) => Alert.alert('Не удалось открыть экран', error instanceof Error ? error.message : String(error))); }, [refresh]);
   useFocusEffect(useCallback(() => { void refresh().catch(() => undefined); }, [refresh]));
+  useEffect(() => {
+    if (!state || !Object.values(state.runtime.values).some((value) => value.type === 'timer' && value.value.status === 'running')) return;
+    const ticker = setInterval(() => setClockNow(Date.now()), 250);
+    return () => clearInterval(ticker);
+  }, [state?.runtime.values]);
+  useEffect(() => {
+    if (!state || !project) return;
+    const ticker = setInterval(() => {
+      if (working || pendingExecution) return;
+      const now = Date.now();
+      for (const [key, failedRevision] of failedBackgroundEvents.current) if (failedRevision !== state.revision) failedBackgroundEvents.current.delete(key);
+      const schedule = dueScheduleEvents(state, now)[0];
+      let timerDue: { parameterId: string; occurredAt: number } | undefined;
+      for (const parameter of state.config.parameters) {
+        if (parameter.kind !== 'stored' || parameter.type !== 'timer') continue;
+        const value = state.runtime.values[parameter.id];
+        if (value?.type !== 'timer' || value.value.status !== 'running' || value.value.direction !== 'down' || value.value.startedAt === undefined || value.value.completionNotified) continue;
+        const duration = BigInt(value.value.elapsedMilliseconds);
+        const remaining = duration - BigInt(Math.max(0, now - value.value.startedAt));
+        if (remaining > 0n || timerFinishesInFlight.current.has(`timer:${parameter.id}`)) continue;
+        const occurredAt = value.value.startedAt + Number(duration);
+        if (!timerDue || occurredAt < timerDue.occurredAt) timerDue = { parameterId: parameter.id, occurredAt };
+      }
+      const scheduleAt = schedule ? Date.parse(schedule.occurredAt) : Number.POSITIVE_INFINITY;
+      if (schedule && scheduleAt <= (timerDue?.occurredAt ?? Number.POSITIVE_INFINITY)) {
+        const key = `schedule:${schedule.ruleId}:${schedule.occurredAt}`;
+        if (failedBackgroundEvents.current.get(key) === state.revision) return;
+        if (timerFinishesInFlight.current.has(key)) return;
+        timerFinishesInFlight.current.add(key);
+        pendingBackgroundKey.current = key;
+        setWorking(true);
+        void loadProjectEngineState(project.id)
+          .then((latest) => advanceExecution(execute(latest, { type: 'scheduleTick', sourceId: schedule.ruleId, occurredAt: schedule.occurredAt, skipped: schedule.skipped })))
+          .catch(async (error) => { const latest = await loadProjectEngineState(project.id).catch(() => null); if (latest) setState(latest); setWorking(false); pendingBackgroundKey.current = null; if (!latest || latest.revision === state.revision) { failedBackgroundEvents.current.set(key, latest?.revision ?? state.revision); Alert.alert('Расписание не выполнено', error instanceof Error ? error.message : String(error)); } })
+          .finally(() => timerFinishesInFlight.current.delete(key));
+        return;
+      }
+      if (timerDue) {
+        const key = `timer:${timerDue.parameterId}`;
+        if (failedBackgroundEvents.current.get(key) === state.revision || timerFinishesInFlight.current.has(key)) return;
+        timerFinishesInFlight.current.add(key);
+        pendingBackgroundKey.current = key;
+        setWorking(true);
+        void loadProjectEngineState(project.id)
+          .then((latest) => advanceExecution(execute(latest, { type: 'timerFinished', sourceId: timerDue!.parameterId, occurredAt: new Date(timerDue!.occurredAt).toISOString() })))
+          .catch(async (error) => { const latest = await loadProjectEngineState(project.id).catch(() => null); if (latest) setState(latest); setWorking(false); pendingBackgroundKey.current = null; if (!latest || latest.revision === state.revision) { failedBackgroundEvents.current.set(key, latest?.revision ?? state.revision); Alert.alert('Таймер не обработан', error instanceof Error ? error.message : String(error)); } })
+          .finally(() => timerFinishesInFlight.current.delete(key));
+      }
+    }, 250);
+    return () => clearInterval(ticker);
+  }, [state, project?.id, working, pendingExecution]);
   useEffect(() => { if (!isLoading && (!project || !screen)) router.replace('/'); }, [isLoading, project, screen]);
 
   if (isLoading || !project || !screen || loading || !state) return <SafeAreaView style={[styles.loading, { backgroundColor: colors.background }]}><ActivityIndicator color={colors.primary} /></SafeAreaView>;
@@ -75,6 +130,7 @@ export default function ProjectScreenWorkspace() {
     if (result.status !== 'completed') return;
     const committed = await commitEngineExecution(project.id, result);
     setState(committed);
+    pendingBackgroundKey.current = null;
     setPendingExecution(null);
     setWorking(false);
     for (const message of result.messages) await new Promise<void>((resolve) => Alert.alert('Сообщение', message, [{ text: 'Продолжить', onPress: () => resolve() }], { cancelable: false }));
@@ -125,6 +181,8 @@ export default function ProjectScreenWorkspace() {
   };
 
   const cancelPendingInput = () => {
+    if (pendingBackgroundKey.current && state) failedBackgroundEvents.current.set(pendingBackgroundKey.current, state.revision);
+    pendingBackgroundKey.current = null;
     pendingExecution?.cancel();
     setPendingExecution(null);
     setInputText('');
@@ -189,7 +247,7 @@ export default function ProjectScreenWorkspace() {
     if (!editingWidget) return;
     try { if (widgetVisibility.trim()) { const visible = evaluate(parseExpression(widgetVisibility), new Map(Object.entries(state.runtime.values))); if (visible.type !== 'boolean') throw new Error('Условие видимости должно возвращать Да / нет.'); } if (widgetTitleExpression.trim()) parseExpression(widgetTitleExpression); if (widgetColorExpression.trim()) { const colorExpr = parseExpression(widgetColorExpression); const color = evaluate(colorExpr, new Map(Object.entries(state.runtime.values))); if (color.type !== 'string' || !/^#[0-9a-f]{3,8}$/i.test(color.value)) throw new Error('Цвет должен вычисляться в HEX-формат, например "#336699".'); } const options = editingWidget.type === 'select' ? widgetOptions.split(',').map((item) => item.trim()).filter(Boolean) : undefined; if (editingWidget.type === 'select' && (!options || options.length < 2)) throw new Error('Для выбора укажите не менее двух вариантов через запятую.'); if (widgetColor.trim() && !/^#[0-9a-f]{3,8}$/i.test(widgetColor.trim())) throw new Error('Введите цвет HEX, например #336699.'); const next = widgets.map((item) => item.id === editingWidget.id ? { ...item, title: widgetTitle.trim() || item.title, visibleWhen: widgetVisibility.trim() || undefined, titleExpression: widgetTitleExpression.trim() || undefined, colorExpression: widgetColorExpression.trim() || (widgetColor.trim() ? JSON.stringify(widgetColor.trim()) : undefined), optionsJson: options ? JSON.stringify(options) : undefined, parentId: widgetParentId || undefined, span: widgetSpan, accessibilityLabel: accessibilityLabelsEnabled ? widgetAccessibility.trim() || undefined : item.accessibilityLabel } : item); await saveScreenWidgets(project.id, screen.id, next); setWidgets(next); setEditingWidget(null); } catch (error) { Alert.alert('Не удалось сохранить виджет', error instanceof Error ? error.message : String(error)); }
   };
-  const valueText = (value: Value): string => value.type === 'boolean' ? (value.value ? 'Да' : 'Нет') : value.type === 'list' ? `${value.value.length} элементов` : value.type === 'timer' ? value.value.elapsedMilliseconds : value.value;
+  const valueText = (value: Value): string => value.type === 'boolean' ? (value.value ? 'Да' : 'Нет') : value.type === 'list' ? `${value.value.length} элементов` : value.type === 'timer' ? formatTimer(value, clockNow) : value.value;
   const dynamicValue = (expression: string | undefined, fallback: string): string => { if (!expression) return fallback; try { return valueText(evaluate(parseExpression(expression), new Map(Object.entries(state.runtime.values)))); } catch { return fallback; } };
   const isWidgetVisible = (widget: ScreenWidget): boolean => { if (!widget.visibleWhen) return true; try { const visible = evaluate(parseExpression(widget.visibleWhen), new Map(Object.entries(state.runtime.values))); return visible.type === 'boolean' && visible.value; } catch { return false; } };
   const updateWidgets = async (next: ScreenWidget[]) => {
@@ -237,4 +295,18 @@ export default function ProjectScreenWorkspace() {
   </SafeAreaView>;
 }
 function uid() { return `ec-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 9)}`; }
+function formatTimer(value: Extract<Value, { type: 'timer' }>, now: number): string {
+  let milliseconds = BigInt(value.value.elapsedMilliseconds);
+  if (value.value.status === 'running' && value.value.startedAt !== undefined) {
+    const elapsed = BigInt(Math.max(0, now - value.value.startedAt));
+    milliseconds = value.value.direction === 'down' ? milliseconds - elapsed : milliseconds + elapsed;
+    if (!value.value.allowNegative && milliseconds < 0n) milliseconds = 0n;
+  }
+  const negative = milliseconds < 0n;
+  const seconds = (negative ? -milliseconds : milliseconds) / 1000n;
+  const hours = seconds / 3600n;
+  const minutes = (seconds % 3600n) / 60n;
+  const remainder = seconds % 60n;
+  return `${negative ? '-' : ''}${hours.toString().padStart(2, '0')}:${minutes.toString().padStart(2, '0')}:${remainder.toString().padStart(2, '0')}`;
+}
 const styles = StyleSheet.create({ safeArea: { flex: 1 }, loading: { flex: 1, alignItems: 'center', justifyContent: 'center' }, headerActions: { flexDirection: 'row', gap: 15, paddingRight: 3 }, content: { paddingHorizontal: 20, paddingTop: 16, paddingBottom: 30, gap: 14 }, sectionHeading: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginBottom: 3 }, modeRow: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', gap: 8 }, heading: { fontFamily: 'Inter_700Bold', fontSize: 20 }, subtitle: { fontFamily: 'Inter_400Regular', fontSize: 12, marginTop: 4 }, revision: { fontFamily: 'Inter_500Medium', fontSize: 11 }, emptyCanvas: { minHeight: 250, borderWidth: 1, borderStyle: 'dashed', padding: 24, alignItems: 'center', justifyContent: 'center' }, canvasGlyph: { width: 49, height: 49, borderRadius: 16, justifyContent: 'center', alignItems: 'center', marginBottom: 14 }, emptyTitle: { fontFamily: 'Inter_600SemiBold', fontSize: 16 }, emptyText: { fontFamily: 'Inter_400Regular', textAlign: 'center', fontSize: 13, lineHeight: 19, marginTop: 6, maxWidth: 280 }, grid: { flexDirection: 'row', flexWrap: 'wrap', gap: 10 }, widget: { minHeight: 108, borderWidth: 1, padding: 12, justifyContent: 'center' }, valueWidget: { alignItems: 'center', justifyContent: 'center', flex: 1 }, containerWidget: { borderWidth: 1, borderStyle: 'dashed', borderRadius: 12, padding: 9, gap: 6 }, groupItems: { width: '100%', gap: 6, marginTop: 8 }, groupItem: { borderWidth: 1, borderRadius: 9, paddingHorizontal: 9, paddingVertical: 6 }, parentPicker: { gap: 5 }, widgetChip: { borderRadius: 9, paddingHorizontal: 9, paddingVertical: 6 }, indicatorTrack: { width: '90%', height: 10, borderRadius: 6, backgroundColor: '#ddd', overflow: 'hidden', marginTop: 10 }, indicatorFill: { height: '100%', borderRadius: 6 }, copy: { fontFamily: 'Inter_400Regular', fontSize: 11, marginTop: 5 }, valueTitle: { fontFamily: 'Inter_500Medium', fontSize: 12 }, valueText: { fontFamily: 'Inter_700Bold', fontSize: 27, marginTop: 6 }, buttonWidget: { minHeight: 70, borderRadius: 13, alignItems: 'center', justifyContent: 'center', gap: 5, padding: 8 }, buttonTitle: { fontFamily: 'Inter_600SemiBold', fontSize: 13, textAlign: 'center' }, widgetActions: { position: 'absolute', right: 7, top: 6, flexDirection: 'row', gap: 12, padding: 4 }, addActions: { flexDirection: 'row', flexWrap: 'wrap', gap: 10 }, referenceList: { flexDirection: 'row', flexWrap: 'wrap', gap: 12 }, tools: { padding: 5, gap: 2 }, modalBackdrop: { flex: 1, backgroundColor: '#0008', justifyContent: 'center', padding: 24 }, modalCard: { borderRadius: 20, padding: 18, gap: 10 }, modalInput: { minHeight: 48, borderWidth: 1, borderRadius: 12, paddingHorizontal: 12, fontFamily: 'Inter_400Regular', fontSize: 15 } });

@@ -34,8 +34,8 @@ function assignable(source: ExpressionType, target: Parameter): boolean {
   return sameExpressionType(source, typeOf(target));
 }
 
-function eventParameterFor(config: ProjectConfiguration, source: Action | { type: 'button' } | { type: 'changed' | 'assigned'; parameterId: string }): Parameter | undefined {
-  if (source.type === 'button' || source.type === 'message' || source.type === 'input') return undefined;
+function eventParameterFor(config: ProjectConfiguration, source: Action | ProjectConfiguration['rules'][number]['eventSource']): Parameter | undefined {
+  if (!('parameterId' in source)) return undefined;
   return config.parameters.find((parameter) => parameter.id === source.parameterId);
 }
 
@@ -130,6 +130,11 @@ function validateAction(
   }
   if (parameter.kind === 'computed') {
     throw new ConfigurationValidationError(`${label}: computed parameters are read-only`, { ruleId, parameterId: parameter.id });
+  }
+  if (action.type === 'timerControl') {
+    if (parameter.type !== 'timer') throw new ConfigurationValidationError(`${label}: timer commands require a timer parameter`, { ruleId, parameterId: parameter.id });
+    if (!['start', 'pause', 'stop', 'reset'].includes(action.command)) throw new ConfigurationValidationError(`${label}: unsupported timer command`, { ruleId, parameterId: parameter.id });
+    return;
   }
   if (action.type === 'set') {
     const valueType = checkExpression(action.expression, parameterMap, eventParameter, label, variables);
@@ -249,8 +254,29 @@ export function validateProjectConfiguration(config: ProjectConfiguration): Comp
       throw new ConfigurationValidationError(`Rule ${rule.name}: risingEdge requires a condition`, { ruleId: rule.id });
     }
     const eventParameter = eventParameterFor(config, rule.eventSource);
-    if (rule.eventSource.type !== 'button' && !eventParameter) {
+    if (['changed', 'assigned', 'timerFinished'].includes(rule.eventSource.type) && !eventParameter) {
       throw new ConfigurationValidationError(`Rule ${rule.name} listens to an unknown parameter`, { ruleId: rule.id });
+    }
+    if (rule.eventSource.type === 'timerFinished' && eventParameter?.type !== 'timer') {
+      throw new ConfigurationValidationError(`Rule ${rule.name} timer event requires a timer parameter`, { ruleId: rule.id, parameterId: eventParameter?.id });
+    }
+    if (rule.eventSource.type === 'periodic') {
+      const interval = rule.eventSource.intervalMilliseconds;
+      if (interval.length > 10 || !/^\d+$/.test(interval) || BigInt(interval) < 1n || BigInt(interval) > 2_147_483_647n) {
+        throw new ConfigurationValidationError(`Rule ${rule.name} interval must be between 1 and 2147483647 milliseconds`, { ruleId: rule.id });
+      }
+      if (!Number.isFinite(Date.parse(rule.eventSource.anchorAt))) throw new ConfigurationValidationError(`Rule ${rule.name} has an invalid interval start`, { ruleId: rule.id });
+      if (!['all', 'once', 'skip'].includes(rule.eventSource.missedPolicy)) throw new ConfigurationValidationError(`Rule ${rule.name} has an invalid missed-event policy`, { ruleId: rule.id });
+    }
+    if (rule.eventSource.type === 'calendar') {
+      const source = rule.eventSource;
+      if (!['daily', 'weekly', 'once'].includes(source.recurrence)) throw new ConfigurationValidationError(`Rule ${rule.name} has an unsupported calendar recurrence`, { ruleId: rule.id });
+      if (!/^([01]\d|2[0-3]):[0-5]\d$/.test(source.localTime)) throw new ConfigurationValidationError(`Rule ${rule.name} calendar time must use HH:mm`, { ruleId: rule.id });
+      try { new Intl.DateTimeFormat('en-US', { timeZone: source.timeZone }).format(0); } catch { throw new ConfigurationValidationError(`Rule ${rule.name} has an invalid time zone`, { ruleId: rule.id }); }
+      if (!Number.isFinite(Date.parse(source.anchorAt))) throw new ConfigurationValidationError(`Rule ${rule.name} has an invalid calendar start`, { ruleId: rule.id });
+      if (source.recurrence === 'weekly' && (!Number.isInteger(source.dayOfWeek) || source.dayOfWeek! < 0 || source.dayOfWeek! > 6)) throw new ConfigurationValidationError(`Rule ${rule.name} needs a weekday`, { ruleId: rule.id });
+      if (source.recurrence === 'once' && (!source.date || !/^\d{4}-\d{2}-\d{2}$/.test(source.date) || !Number.isFinite(Date.parse(`${source.date}T00:00:00Z`)) || new Date(`${source.date}T00:00:00Z`).toISOString().slice(0, 10) !== source.date)) throw new ConfigurationValidationError(`Rule ${rule.name} needs a valid date`, { ruleId: rule.id });
+      if (!['all', 'once', 'skip'].includes(source.missedPolicy)) throw new ConfigurationValidationError(`Rule ${rule.name} has an invalid missed-event policy`, { ruleId: rule.id });
     }
     if (rule.condition) {
       if (rule.triggerMode === 'risingEdge' && collectEventReferences(rule.condition)) {
@@ -308,7 +334,7 @@ function recomputeComputed(
 
 export function createInitialProjectState(config: ProjectConfiguration, revision = 0): ProjectState {
   const computed = validateProjectConfiguration(config);
-  const runtime: RuntimeState = { values: {}, ruleTruth: {} };
+  const runtime: RuntimeState = { values: {}, ruleTruth: {}, scheduleCursors: {} };
   for (const parameter of config.parameters) {
     if (parameter.kind === 'stored') {
       runtime.values[parameter.id] = canonicalizeValue(parameter.initialValue, parameter.type, parameter.listItemType);
@@ -331,7 +357,9 @@ export function rehydrateProjectState(
   revision: number,
 ): ProjectState {
   const computed = validateProjectConfiguration(config);
-  const cleanRuntime: RuntimeState = { values: {}, ruleTruth: { ...runtime.ruleTruth } };
+  const scheduleRuleIds = new Set(config.rules.filter((rule) => rule.eventSource.type === 'periodic' || rule.eventSource.type === 'calendar').map((rule) => rule.id));
+  const scheduleCursors = Object.fromEntries(Object.entries(runtime.scheduleCursors ?? {}).filter(([id, value]) => scheduleRuleIds.has(id) && Number.isFinite(Date.parse(value))));
+  const cleanRuntime: RuntimeState = { values: {}, ruleTruth: { ...runtime.ruleTruth }, scheduleCursors };
   for (const parameter of config.parameters) {
     if (parameter.kind === 'stored') {
       cleanRuntime.values[parameter.id] = canonicalizeValue(

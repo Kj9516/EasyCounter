@@ -1,4 +1,5 @@
 import { useState } from 'react';
+import type { ReactNode } from 'react';
 import { Pressable, StyleSheet, Text, View } from 'react-native';
 import { useColors } from '@/hooks/useColors';
 
@@ -61,7 +62,7 @@ export function CompactChoice({
   );
 }
 
-export function RequiredLabel({ children }: { children: string }) {
+export function RequiredLabel({ children }: { children: ReactNode }) {
   const colors = useColors();
   return <Text style={[styles.requiredLabel, { color: colors.foreground }]}>{children} <Text style={{ color: colors.destructive }}>*</Text></Text>;
 }

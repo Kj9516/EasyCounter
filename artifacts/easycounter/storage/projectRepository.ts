@@ -1,7 +1,9 @@
 import type { SQLiteDatabase } from 'expo-sqlite';
 import type { Project, ProjectDraft, ProjectScreen } from '../types/project';
-import { rehydrateProjectState } from '../engine/configuration';
-import type { ExecutionResult, ProjectConfiguration, ProjectState, RuntimeState } from '../engine/types';
+import { createInitialProjectState, rehydrateProjectState, validateProjectConfiguration } from '../engine/configuration';
+import { canonicalizeValue } from '../engine/evaluator';
+import { parseExpression } from '../engine/parser';
+import type { Action, EngineEvent, ExecutionResult, Expr, ProjectConfiguration, ProjectState, RuntimeState } from '../engine/types';
 
 interface ProjectRow {
   id: string;
@@ -68,6 +70,19 @@ export interface OperationHistoryEntry {
   changes: ExecutionResult['changes'];
   revision: number;
   messages: string[];
+}
+
+export interface ProjectArchive {
+  formatVersion: 1;
+  kind: 'template' | 'full';
+  exportedAt: string;
+  project: { name: string; description: string };
+  preferences?: { accessibilityLabelsEnabled: boolean };
+  screens: Array<{ name: string; position: number; widgets: Array<Omit<ScreenWidget, 'screenId'>> }>;
+  configuration: ProjectConfiguration;
+  revision?: number;
+  runtime?: RuntimeState;
+  history?: OperationHistoryEntry[];
 }
 
 function parseJson<T>(value: string, label: string): T {
@@ -427,61 +442,9 @@ export async function duplicateProject(
   db: SQLiteDatabase,
   projectId: string,
 ): Promise<Project> {
-  const projects = await listProjects(db);
-  const source = projects.find((project) => project.id === projectId);
-  if (!source) throw new Error('Не удалось найти проект для копирования.');
-
-  const now = new Date().toISOString();
-  const duplicateId = makeId();
-  const duplicate: Project = {
-    ...source,
-    id: duplicateId,
-    name: `${source.name} (копия)`,
-    createdAt: now,
-    updatedAt: now,
-    screens: source.screens.map((screen) => ({
-      ...screen,
-      id: makeId(),
-      projectId: duplicateId,
-      createdAt: now,
-    })),
-  };
-
-  await db.withExclusiveTransactionAsync(async (transaction) => {
-    await transaction.runAsync(
-      'INSERT INTO projects (id, name, description, created_at, updated_at) VALUES (?, ?, ?, ?, ?);',
-      duplicate.id,
-      duplicate.name,
-      duplicate.description,
-      duplicate.createdAt,
-      duplicate.updatedAt,
-    );
-    for (const screen of duplicate.screens) {
-      await transaction.runAsync(
-        'INSERT INTO project_screens (id, project_id, name, position, created_at) VALUES (?, ?, ?, ?, ?);',
-        screen.id,
-        duplicate.id,
-        screen.name,
-        screen.position,
-        screen.createdAt,
-      );
-    }
-    const engineState = await transaction.getFirstAsync<EngineStateRow>(
-      'SELECT project_id, configuration_json, runtime_json, revision FROM project_engine_state WHERE project_id = ?;',
-      projectId,
-    );
-    if (engineState) {
-      await transaction.runAsync(
-        'INSERT INTO project_engine_state (project_id, configuration_json, runtime_json, revision, updated_at) VALUES (?, ?, ?, 0, ?);',
-        duplicateId,
-        engineState.configuration_json,
-        engineState.runtime_json,
-        now,
-      );
-    }
-  });
-
-  return duplicate;
+  const archive = await exportProjectArchive(db, projectId, 'full', true);
+  archive.project.name = `${archive.project.name} (копия)`;
+  return importProjectArchive(db, JSON.stringify(archive));
 }
 
 export async function updateProject(
@@ -651,14 +614,16 @@ export async function commitEngineExecution(
       'UPDATE project_engine_state SET runtime_json = ?, revision = ?, updated_at = ? WHERE project_id = ? AND revision = ?;',
       JSON.stringify(runtime), revision, now, projectId, current.revision,
     );
-    await transaction.runAsync(
-      'INSERT INTO project_operation_history (project_id, occurred_at, root_event_json, changes_json, revision) VALUES (?, ?, ?, ?, ?);',
-      projectId,
-      execution.rootEvent.occurredAt ?? now,
-      JSON.stringify(historyEvent),
-      JSON.stringify(execution.changes),
-      revision,
-    );
+    if (!(execution.rootEvent.type === 'scheduleTick' && execution.rootEvent.skipped)) {
+      await transaction.runAsync(
+        'INSERT INTO project_operation_history (project_id, occurred_at, root_event_json, changes_json, revision) VALUES (?, ?, ?, ?, ?);',
+        projectId,
+        execution.rootEvent.occurredAt ?? now,
+        JSON.stringify(historyEvent),
+        JSON.stringify(execution.changes),
+        revision,
+      );
+    }
     committedState = { config: configuration, runtime, revision };
   });
   return committedState!;
@@ -687,4 +652,231 @@ export async function listProjectOperationHistory(
 
 export async function clearProjectOperationHistory(db: SQLiteDatabase, projectId: string): Promise<void> {
   await db.runAsync('DELETE FROM project_operation_history WHERE project_id = ?;', projectId);
+}
+
+export async function exportProjectArchive(db: SQLiteDatabase, projectId: string, kind: 'template' | 'full', includeHistory = false): Promise<ProjectArchive> {
+  const project = (await listProjects(db)).find((item) => item.id === projectId);
+  if (!project) throw new Error('Не удалось найти проект для экспорта.');
+  const state = await loadProjectEngineState(db, projectId);
+  const screens = await Promise.all(project.screens.map(async (screen) => ({
+    name: screen.name,
+    position: screen.position,
+    widgets: (await listScreenWidgets(db, projectId, screen.id)).map(({ screenId: _screenId, ...widget }) => widget),
+  })));
+  const archive: ProjectArchive = {
+    formatVersion: 1,
+    kind,
+    exportedAt: new Date().toISOString(),
+    project: { name: project.name, description: project.description },
+    preferences: { accessibilityLabelsEnabled: await getProjectAccessibilityLabelsEnabled(db, projectId) },
+    screens,
+    configuration: state.config,
+    ...(kind === 'full' ? { runtime: state.runtime, revision: state.revision } : {}),
+    ...(kind === 'full' && includeHistory ? { history: await listProjectOperationHistory(db, projectId) } : {}),
+  };
+  const serialized = JSON.stringify(archive);
+  if (serialized.length > 5_000_000) throw new Error('Экспорт превышает допустимый размер 5 МБ. Очистите историю и повторите попытку.');
+  return archive;
+}
+
+function remapExpression(expression: Expr, parameterIds: Map<string, string>): Expr {
+  switch (expression.kind) {
+    case 'literal': return { ...expression };
+    case 'parameter': return { ...expression, id: parameterIds.get(expression.id) ?? expression.id };
+    case 'event': return { ...expression };
+    case 'unary': return { ...expression, operand: remapExpression(expression.operand, parameterIds) };
+    case 'binary': return { ...expression, left: remapExpression(expression.left, parameterIds), right: remapExpression(expression.right, parameterIds) };
+    case 'call': return { ...expression, args: expression.args.map((argument) => remapExpression(argument, parameterIds)) };
+  }
+}
+
+function remapAction(action: Action, parameterIds: Map<string, string>): Action {
+  if (action.type === 'message') return { ...action };
+  if (action.type === 'input') return { ...action, ...(action.parameterId ? { parameterId: parameterIds.get(action.parameterId) ?? action.parameterId } : {}) };
+  const parameterId = parameterIds.get(action.parameterId) ?? action.parameterId;
+  if (action.type === 'timerControl') return { ...action, parameterId };
+  if (action.type === 'listRemove') return { ...action, parameterId, index: remapExpression(action.index, parameterIds) };
+  if (action.type === 'listReplace') return { ...action, parameterId, index: remapExpression(action.index, parameterIds), expression: remapExpression(action.expression, parameterIds) };
+  return { ...action, parameterId, expression: remapExpression(action.expression, parameterIds) };
+}
+
+function historicalId(ids: Map<string, string>, sourceId: string): string {
+  let result = ids.get(sourceId);
+  if (!result) { result = makeId(); ids.set(sourceId, result); }
+  return result;
+}
+
+function remapEvent(event: EngineEvent, parameterIds: Map<string, string>, buttonIds: Map<string, string>, ruleIds: Map<string, string>): EngineEvent {
+  const result = { ...event };
+  if (event.type === 'button') result.sourceId = historicalId(buttonIds, event.sourceId);
+  else if (event.type === 'scheduleTick') result.sourceId = historicalId(ruleIds, event.sourceId);
+  else if (['changed', 'assigned', 'timerFinished'].includes(event.type)) result.sourceId = historicalId(parameterIds, event.sourceId);
+  if (event.parameterIds) result.parameterIds = event.parameterIds.map((id) => historicalId(parameterIds, id));
+  return result;
+}
+
+/** Validate and import an archive as a fully independent project with fresh IDs. */
+export async function importProjectArchive(db: SQLiteDatabase, input: string): Promise<Project> {
+  if (input.length > 5_000_000) throw new Error('Файл импорта превышает допустимый размер 5 МБ.');
+  let parsed: unknown;
+  try { parsed = JSON.parse(input); } catch { throw new Error('Файл не является корректным JSON.'); }
+  if (!parsed || typeof parsed !== 'object') throw new Error('Структура файла проекта некорректна.');
+  const archive = parsed as ProjectArchive;
+  if (archive.formatVersion !== 1 || !['template', 'full'].includes(archive.kind)) throw new Error('Версия файла проекта не поддерживается.');
+  if (typeof archive.exportedAt !== 'string' || !Number.isFinite(Date.parse(archive.exportedAt))) throw new Error('В файле указана некорректная дата экспорта.');
+  if (!archive.project || typeof archive.project.name !== 'string' || typeof archive.project.description !== 'string') throw new Error('В файле отсутствуют сведения о проекте.');
+  if (archive.preferences !== undefined && typeof archive.preferences.accessibilityLabelsEnabled !== 'boolean') throw new Error('Настройки проекта в файле некорректны.');
+  if (!Array.isArray(archive.screens) || archive.screens.length < 1 || archive.screens.length > 100 || !archive.screens.every((screen) => screen && typeof screen.name === 'string' && Array.isArray(screen.widgets))) throw new Error('Список экранов в файле некорректен.');
+  if (archive.screens.reduce((total, screen) => total + screen.widgets.length, 0) > 5000) throw new Error('В проекте слишком много виджетов.');
+  if (!archive.configuration || !Array.isArray(archive.configuration.parameters) || !Array.isArray(archive.configuration.rules) || archive.configuration.parameters.length > 500 || archive.configuration.rules.length > 500) throw new Error('Конфигурация в файле некорректна или слишком велика.');
+  if (archive.kind === 'full' && archive.revision !== undefined && (!Number.isSafeInteger(archive.revision) || archive.revision < 0)) throw new Error('В файле указана некорректная версия состояния.');
+  if (archive.runtime !== undefined && (!archive.runtime || typeof archive.runtime !== 'object' || !archive.runtime.values || typeof archive.runtime.values !== 'object' || !archive.runtime.ruleTruth || typeof archive.runtime.ruleTruth !== 'object')) throw new Error('Текущее состояние проекта в файле некорректно.');
+  if (archive.history !== undefined && (!Array.isArray(archive.history) || archive.history.length > 5000)) throw new Error('История в файле некорректна или слишком велика.');
+  if (archive.history) for (const entry of archive.history) {
+    if (!entry || typeof entry !== 'object' || !entry.rootEvent || typeof entry.rootEvent.sourceId !== 'string' || !['button', 'changed', 'assigned', 'reset', 'timerFinished', 'scheduleTick'].includes(entry.rootEvent.type) || !Array.isArray(entry.changes) || entry.changes.length > 10_000 || !Number.isFinite(Date.parse(entry.occurredAt))) throw new Error('В файле найдена поврежденная запись истории.');
+    if (entry.messages !== undefined && (!Array.isArray(entry.messages) || entry.messages.some((message) => typeof message !== 'string'))) throw new Error('Сообщения в истории повреждены.');
+    for (const change of entry.changes) {
+      if (!change || typeof change.parameterId !== 'string' || (change.ruleId !== null && typeof change.ruleId !== 'string') || !change.oldValue || !change.newValue) throw new Error('Изменение в истории повреждено.');
+      try { canonicalizeValue(change.oldValue); canonicalizeValue(change.newValue); } catch { throw new Error('Значение в истории повреждено.'); }
+    }
+  }
+  validateProjectConfiguration(archive.configuration);
+
+  const now = new Date().toISOString();
+  const projectId = makeId();
+  const archivedScreens = archive.screens as Array<{ id?: string; name: string; position: number; widgets: Array<Record<string, unknown>> }>;
+  const screens = archivedScreens.map((screen, position) => ({ id: makeId(), name: requireName(screen.name, 'Экран'), position: Number.isSafeInteger(screen.position) && screen.position >= 0 ? screen.position : position }));
+  const parameterIds = new Map(archive.configuration.parameters.map((parameter) => [parameter.id, makeId()]));
+  const ruleIds = new Map(archive.configuration.rules.map((rule) => [rule.id, makeId()]));
+  const buttonIds = new Map<string, string>();
+  for (const screen of archivedScreens) for (const widget of screen.widgets) {
+    if (typeof widget.buttonId === 'string' && widget.buttonId) buttonIds.set(widget.buttonId, makeId());
+  }
+  for (const rule of archive.configuration.rules) if (rule.eventSource.type === 'button' && !buttonIds.has(rule.eventSource.id)) throw new Error(`Правило «${rule.name}» ссылается на отсутствующую кнопку.`);
+  const widgetIds = new Map<string, string>();
+  for (const screen of archivedScreens) for (const widget of screen.widgets) {
+    if (typeof widget.id === 'string' && widget.id) widgetIds.set(widget.id, makeId());
+  }
+  const configuration: ProjectConfiguration = {
+    parameters: archive.configuration.parameters.map((parameter) => ({ ...parameter, id: parameterIds.get(parameter.id)!, ...(parameter.kind === 'computed' ? { formula: remapExpression(parameter.formula, parameterIds) } : {}) })),
+    rules: archive.configuration.rules.map((rule) => ({
+      ...rule,
+      id: ruleIds.get(rule.id)!,
+      eventSource: rule.eventSource.type === 'button' ? { ...rule.eventSource, id: buttonIds.get(rule.eventSource.id) ?? makeId() }
+        : rule.eventSource.type === 'changed' || rule.eventSource.type === 'assigned' || rule.eventSource.type === 'timerFinished' ? { ...rule.eventSource, parameterId: parameterIds.get(rule.eventSource.parameterId) ?? rule.eventSource.parameterId }
+          : { ...rule.eventSource },
+      ...(rule.condition ? { condition: remapExpression(rule.condition, parameterIds) } : {}),
+      actions: rule.actions.map((action) => remapAction(action, parameterIds)),
+    })),
+  };
+  if (archive.kind === 'template') {
+    for (const rule of configuration.rules) if (rule.eventSource.type === 'periodic' || rule.eventSource.type === 'calendar') rule.eventSource.anchorAt = now;
+  }
+  validateProjectConfiguration(configuration);
+
+  const widgetTypes = new Set(['value', 'button', 'input', 'toggle', 'select', 'indicator', 'container', 'text']);
+  const parameterById = new Map(configuration.parameters.map((parameter) => [parameter.id, parameter]));
+  const remapWidgetExpression = (text: unknown) => {
+    if (typeof text !== 'string' || !text) return undefined;
+    const expression = parseExpression(text);
+    const stack = [expression];
+    while (stack.length) {
+      const item = stack.pop()!;
+      if (item.kind === 'parameter') {
+        if (!parameterById.has(item.id)) throw new Error(`Виджет ссылается на отсутствующий параметр ${item.id}.`);
+      } else if (item.kind === 'unary') stack.push(item.operand);
+      else if (item.kind === 'binary') stack.push(item.left, item.right);
+      else if (item.kind === 'call') stack.push(...item.args);
+    }
+    let result = text;
+    for (const [oldId, newId] of parameterIds) result = result.split(`@{${oldId}}`).join(`@{${newId}}`);
+    return result;
+  };
+  const screenWidgets = archivedScreens.map((screen, screenIndex) => {
+    if (screen.widgets.length > 1000) throw new Error('На экране слишком много виджетов.');
+    return screen.widgets.map((raw) => {
+      if (!raw || typeof raw !== 'object' || !widgetTypes.has(String(raw.type)) || typeof raw.title !== 'string' || typeof raw.id !== 'string' || !raw.id.trim()) throw new Error('В файле найден неизвестный или повреждённый виджет.');
+      const sourceParameterId = typeof raw.parameterId === 'string' ? raw.parameterId : undefined;
+      const parameterId = sourceParameterId ? parameterIds.get(sourceParameterId) : undefined;
+      if (sourceParameterId && !parameterId) throw new Error('Виджет ссылается на отсутствующий параметр.');
+      const buttonId = typeof raw.buttonId === 'string' ? buttonIds.get(raw.buttonId) : undefined;
+      const type = String(raw.type) as ScreenWidget['type'];
+      const title = requireName(raw.title, 'Виджет');
+      if (title.length > 160) throw new Error('Название виджета длиннее 160 символов.');
+      if (raw.span !== undefined && raw.span !== 1 && raw.span !== 2) throw new Error('Некорректная ширина виджета.');
+      const parameter = parameterId ? parameterById.get(parameterId) : undefined;
+      if (['value', 'indicator'].includes(type) && !parameterId) throw new Error(`Виджету «${raw.title}» нужен параметр.`);
+      if (['button'].includes(type) && !buttonId) throw new Error(`Кнопке «${raw.title}» нужен ID действия.`);
+      if (type === 'button' && parameterId) throw new Error('Кнопка не может быть привязана к параметру.');
+      if (['value', 'indicator'].includes(type) && buttonId) throw new Error('Виджет значения не может запускать действие кнопки.');
+      if (['input', 'toggle', 'select'].includes(type) && (!parameterId || !buttonId)) throw new Error(`Виджету «${raw.title}» нужны параметр и ID действия.`);
+      if (['container', 'text'].includes(type) && (parameterId || buttonId)) throw new Error(`Виджет «${raw.title}» не поддерживает привязку.`);
+      if (type === 'toggle' && (parameter?.type !== 'boolean' || parameter.kind !== 'stored')) throw new Error('Переключатель должен быть связан с сохраняемым логическим параметром.');
+      if (['input', 'select'].includes(type) && (!parameter || parameter.kind !== 'stored' || ['list', 'timer'].includes(parameter.type))) throw new Error('Поле ввода связано с неподдерживаемым параметром.');
+      let optionsJson: string | undefined;
+      if (raw.optionsJson !== undefined) {
+        if (typeof raw.optionsJson !== 'string') throw new Error('Варианты виджета повреждены.');
+        let options: unknown;
+        try { options = JSON.parse(raw.optionsJson); } catch { throw new Error('Варианты выбора в файле повреждены.'); }
+        if (!Array.isArray(options) || options.some((item) => typeof item !== 'string')) throw new Error('Варианты должны быть списком строк.');
+        if (type === 'select' && options.length < 2) throw new Error('Выбор должен содержать минимум два текстовых варианта.');
+        optionsJson = raw.optionsJson;
+      } else if (type === 'select') {
+        throw new Error('Выбор должен содержать минимум два текстовых варианта.');
+      }
+      for (const property of ['visibleWhen', 'titleExpression', 'colorExpression'] as const) if (raw[property] !== undefined && typeof raw[property] !== 'string') throw new Error(`Выражение виджета ${title} повреждено.`);
+      if (typeof raw.parentId === 'string' && !widgetIds.has(raw.parentId)) throw new Error('Виджет ссылается на отсутствующий контейнер.');
+      const parentId = typeof raw.parentId === 'string' ? widgetIds.get(raw.parentId) : undefined;
+      return {
+        id: widgetIds.get(raw.id)!, type, title, screenId: screens[screenIndex].id,
+        position: Number.isSafeInteger(raw.position) && Number(raw.position) >= 0 ? Number(raw.position) : 0,
+        span: raw.span === 2 ? 2 as const : 1 as const,
+        ...(parameterId ? { parameterId } : {}), ...(buttonId ? { buttonId } : {}),
+        ...(remapWidgetExpression(raw.visibleWhen) ? { visibleWhen: remapWidgetExpression(raw.visibleWhen) } : {}),
+        ...(remapWidgetExpression(raw.titleExpression) ? { titleExpression: remapWidgetExpression(raw.titleExpression) } : {}),
+        ...(remapWidgetExpression(raw.colorExpression) ? { colorExpression: remapWidgetExpression(raw.colorExpression) } : {}),
+        ...(optionsJson !== undefined ? { optionsJson } : {}),
+        ...(parentId ? { parentId } : {}), ...(typeof raw.accessibilityLabel === 'string' ? { accessibilityLabel: raw.accessibilityLabel } : {}),
+      } satisfies ScreenWidget;
+    });
+  });
+  for (const widgets of screenWidgets) {
+    const containers = new Set(widgets.filter((widget) => widget.type === 'container').map((widget) => widget.id));
+    for (const widget of widgets) if (widget.parentId && (!containers.has(widget.parentId) || widget.type === 'container')) throw new Error('Связь контейнера в файле проекта повреждена.');
+  }
+
+  let runtime: RuntimeState;
+  const revision = archive.kind === 'full' ? archive.revision ?? 0 : 0;
+  if (archive.kind === 'full' && archive.runtime) {
+    const values = Object.fromEntries(Object.entries(archive.runtime.values ?? {}).map(([id, value]) => [parameterIds.get(id) ?? id, value]));
+    const ruleTruth = Object.fromEntries(Object.entries(archive.runtime.ruleTruth ?? {}).map(([id, truth]) => [ruleIds.get(id) ?? id, truth]));
+    const scheduleCursors = archive.kind === 'full' ? Object.fromEntries(Object.entries(archive.runtime.scheduleCursors ?? {}).map(([id, cursor]) => [ruleIds.get(id) ?? id, cursor])) : {};
+    runtime = rehydrateProjectState(configuration, { values, ruleTruth, scheduleCursors }, revision).runtime;
+  } else runtime = createInitialProjectState(configuration).runtime;
+  const history = archive.kind === 'full' && Array.isArray(archive.history) ? archive.history : [];
+  const projectName = requireName(archive.project.name, 'Проект');
+  if (projectName.length > 120) throw new Error('Название проекта длиннее 120 символов.');
+  const project: Project = { id: projectId, name: projectName, description: archive.project.description.slice(0, 500), createdAt: now, updatedAt: now, screens: screens.map((screen) => ({ ...screen, projectId, createdAt: now })) };
+  await db.withExclusiveTransactionAsync(async (transaction) => {
+    await transaction.runAsync('INSERT INTO projects (id, name, description, created_at, updated_at) VALUES (?, ?, ?, ?, ?);', project.id, project.name, project.description, now, now);
+    for (let index = 0; index < screens.length; index++) {
+      const screen = project.screens[index];
+      await transaction.runAsync('INSERT INTO project_screens (id, project_id, name, position, created_at) VALUES (?, ?, ?, ?, ?);', screen.id, project.id, screen.name, screen.position, now);
+      for (const widget of screenWidgets[index]) await transaction.runAsync(
+        'INSERT INTO screen_widgets (id, project_id, screen_id, type, title, parameter_id, button_id, position, span, visible_when, title_expression, color_expression, options_json, parent_id, accessibility_label) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);',
+        widget.id, project.id, screen.id, widget.type, widget.title.trim(), widget.parameterId ?? null, widget.buttonId ?? null, widget.position, widget.span ?? 1, widget.visibleWhen ?? null, widget.titleExpression ?? null, widget.colorExpression ?? null, widget.optionsJson ?? null, widget.parentId ?? null, widget.accessibilityLabel ?? null,
+      );
+    }
+    await transaction.runAsync('INSERT INTO project_engine_state (project_id, configuration_json, runtime_json, revision, updated_at) VALUES (?, ?, ?, ?, ?);', project.id, JSON.stringify(configuration), JSON.stringify(runtime), revision, now);
+    if (archive.preferences?.accessibilityLabelsEnabled) await transaction.runAsync('INSERT INTO project_preferences (project_id, accessibility_labels_enabled) VALUES (?, 1);', project.id);
+    for (const [index, entry] of history.entries()) {
+      if (!entry || !entry.rootEvent || !Array.isArray(entry.changes)) continue;
+      const rootEvent = remapEvent(entry.rootEvent, parameterIds, buttonIds, ruleIds);
+      const changes = entry.changes.map((change) => ({ ...change, parameterId: historicalId(parameterIds, change.parameterId), ruleId: change.ruleId ? historicalId(ruleIds, change.ruleId) : null }));
+      const messages = Array.isArray(entry.messages) ? entry.messages.slice(0, 1000) : [];
+      const entryRevision = Number.isSafeInteger(entry.revision) && entry.revision > 0 ? entry.revision : index + 1;
+      await transaction.runAsync('INSERT INTO project_operation_history (project_id, occurred_at, root_event_json, changes_json, revision) VALUES (?, ?, ?, ?, ?);', project.id, rootEvent.occurredAt ?? now, JSON.stringify({ ...rootEvent, messages }), JSON.stringify(changes), entryRevision);
+    }
+  });
+  return project;
 }
