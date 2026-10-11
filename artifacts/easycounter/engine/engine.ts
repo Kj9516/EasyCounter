@@ -351,10 +351,19 @@ export function execute(
       const alreadyBelowZero = timer.allowNegative && BigInt(timer.elapsedMilliseconds) < 0n;
       if ((action.command === 'reset' || (action.command === 'start' && timer.status === 'stopped' && !alreadyBelowZero)) && parameter.timerDurationParameterId) {
         const sourceValue = runtime.values[parameter.timerDurationParameterId];
-        if (!sourceValue || (sourceValue.type !== 'integer' && sourceValue.type !== 'decimal')) throw new Error('Timer duration source must contain a number of seconds');
-        const duration = Decimal.parse(sourceValue.value).mul(Decimal.parse('1000'));
-        if (duration.scale !== 0 || duration.coefficient < 0n) throw new Error('Timer duration must be a non-negative number of seconds with millisecond precision');
-        const milliseconds = duration.toString();
+        if (!sourceValue || (sourceValue.type !== 'integer' && sourceValue.type !== 'decimal' && sourceValue.type !== 'time')) throw new Error('Timer duration source must contain seconds or a time value');
+        let milliseconds: string;
+        if (sourceValue.type === 'time') {
+          const match = /^(\d{2}):(\d{2})(?::(\d{2})(?:\.(\d{1,3}))?)?$/.exec(sourceValue.value);
+          if (!match) throw new Error('Timer duration time must use HH:mm or HH:mm:ss.SSS');
+          const hours = Number(match[1]); const minutes = Number(match[2]); const seconds = Number(match[3] ?? '0');
+          if (hours > 23 || minutes > 59 || seconds > 59) throw new Error('Timer duration time is outside the valid range');
+          milliseconds = String(hours * 3_600_000 + minutes * 60_000 + seconds * 1000 + Number((match[4] ?? '').padEnd(3, '0')));
+        } else {
+          const duration = Decimal.parse(sourceValue.value).mul(Decimal.parse('1000'));
+          if (duration.scale !== 0 || duration.coefficient < 0n) throw new Error('Timer duration must be a non-negative number of seconds with millisecond precision');
+          milliseconds = duration.toString();
+        }
         timer = { ...timer, elapsedMilliseconds: milliseconds, initialMilliseconds: milliseconds };
       }
       let elapsed = BigInt(timer.elapsedMilliseconds);

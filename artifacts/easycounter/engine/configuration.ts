@@ -228,8 +228,8 @@ export function validateProjectConfiguration(config: ProjectConfiguration): Comp
     }
     if (parameter.kind === 'stored' && parameter.timerDurationParameterId) {
       const durationParameter = config.parameters.find((candidate) => candidate.id === parameter.timerDurationParameterId);
-      if (parameter.type !== 'timer' || !durationParameter || durationParameter.id === parameter.id || !['integer', 'decimal'].includes(durationParameter.type)) {
-        throw new ConfigurationValidationError('A timer duration source must be another integer or decimal parameter', { parameterId: parameter.id });
+      if (parameter.type !== 'timer' || !durationParameter || durationParameter.id === parameter.id || !['integer', 'decimal', 'time'].includes(durationParameter.type)) {
+        throw new ConfigurationValidationError('A timer duration source must be another integer, decimal, or time parameter', { parameterId: parameter.id });
       }
     }
     if (parameter.kind === 'computed' && !parameter.formula) {

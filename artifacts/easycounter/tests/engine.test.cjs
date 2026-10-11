@@ -362,3 +362,11 @@ test('timers read their duration in seconds from another parameter when started 
   assert.equal(result.state.runtime.values.Timer.value.elapsedMilliseconds, '90000');
   assert.equal(result.state.runtime.values.Timer.value.initialMilliseconds, '90000');
 });
+
+test('timers accept a time parameter as elapsed time since midnight', () => {
+  const clockValue = { id: 'Clock', name: 'Clock', kind: 'stored', type: 'time', initialValue: { type: 'time', value: '01:02:03.450' } };
+  const timer = { id: 'Timer', name: 'Timer', kind: 'stored', type: 'timer', timerDurationParameterId: 'Clock', initialValue: { type: 'timer', value: { elapsedMilliseconds: '0', initialMilliseconds: '0', direction: 'down', status: 'stopped', allowNegative: false } } };
+  const result = completed(execute(createInitialProjectState(config([clockValue, timer], [rule('start', { type: 'button', id: 'start' }, [{ type: 'timerControl', parameterId: 'Timer', command: 'start' }])])), button('start')));
+  assert.equal(result.state.runtime.values.Timer.value.elapsedMilliseconds, '3723450');
+  assert.equal(result.state.runtime.values.Timer.value.initialMilliseconds, '3723450');
+});

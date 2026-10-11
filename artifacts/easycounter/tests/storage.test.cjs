@@ -245,7 +245,7 @@ test('migrates an existing version 1 project to the engine tables', async () => 
   try {
     const state = await repository.loadProjectEngineState(migrated, 'legacy');
     assert.deepEqual(state.config, { parameters: [], rules: [] });
-    assert.equal((await migrated.getFirstAsync('PRAGMA user_version;')).user_version, 11);
+    assert.equal((await migrated.getFirstAsync('PRAGMA user_version;')).user_version, 12);
     assert.equal(await migrated.getFirstAsync("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'screen_widgets';") !== null, true);
   } finally {
     migrated.close();
@@ -266,8 +266,8 @@ test('changing a parameter type resets its runtime value atomically', async () =
 test('all screen widget types, layout, accessibility, and bindings survive SQLite round trips', async () => {
   const project = await repository.createProject(database, { name: 'Widget grid', description: '' });
   const widgets = [
-    { id: 'wide', type: 'value', title: 'Wide', parameterId: 'value', screenId: project.screens[0].id, span: 2, visibleWhen: '@{value} > 0', titleExpression: 'text(@{value})', colorExpression: '"red"', accessibilityLabel: 'Значение' },
-    { id: 'button', type: 'button', title: 'Button', buttonId: 'button', screenId: project.screens[0].id, span: 1 },
+    { id: 'wide', type: 'value', title: 'Wide', parameterId: 'value', screenId: project.screens[0].id, span: 2, height: 3, visibleWhen: '@{value} > 0', titleExpression: 'text(@{value})', colorExpression: '"red"', accessibilityLabel: 'Значение' },
+    { id: 'button', type: 'button', title: 'Button', buttonId: 'button', screenId: project.screens[0].id, span: 1, height: 2 },
     { id: 'input', type: 'input', title: 'Input', parameterId: 'value', buttonId: 'input-event', screenId: project.screens[0].id, span: 1 },
     { id: 'toggle', type: 'toggle', title: 'Toggle', parameterId: 'flag', buttonId: 'toggle-event', screenId: project.screens[0].id, span: 1 },
     { id: 'group', type: 'container', title: 'Group', screenId: project.screens[0].id, span: 2, accessibilityLabel: 'Группа' },
@@ -280,6 +280,7 @@ test('all screen widget types, layout, accessibility, and bindings survive SQLit
   ], rules: [] });
   await repository.saveScreenWidgets(database, project.id, project.screens[0].id, widgets);
   assert.deepEqual(await repository.listScreenWidgets(database, project.id, project.screens[0].id), widgets.map((widget, position) => ({ ...widget, position })));
+  await assert.rejects(repository.saveScreenWidgets(database, project.id, project.screens[0].id, [{ ...widgets[0], height: 4 }]), /Высота виджета/);
   await assert.rejects(repository.saveScreenWidgets(database, project.id, project.screens[0].id, [
     { id: 'missing', type: 'value', title: 'Missing', parameterId: 'deleted', screenId: project.screens[0].id, position: 0 },
   ]), /больше не существует/);
@@ -352,7 +353,7 @@ test('template and full project archives import as independent copies with remap
   };
   await repository.saveProjectEngineConfiguration(database, source.id, configuration);
   await repository.saveScreenWidgets(database, source.id, screen.id, [
-    { id: 'widget-value', type: 'value', title: 'Count', parameterId: 'count', screenId: screen.id, position: 0 },
+    { id: 'widget-value', type: 'value', title: 'Count', parameterId: 'count', screenId: screen.id, position: 0, height: 2 },
     { id: 'widget-button', type: 'button', title: 'Add', buttonId: 'button-add', screenId: screen.id, position: 1 },
   ]);
   const operation = engine.execute(await repository.loadProjectEngineState(database, source.id), { type: 'button', sourceId: 'button-add' });
@@ -366,6 +367,7 @@ test('template and full project archives import as independent copies with remap
   assert.equal(copiedState.config.rules[0].actions[0].parameterId, copiedState.config.parameters[0].id);
   const copiedWidgets = await repository.listScreenWidgets(database, imported.id, imported.screens[0].id);
   assert.equal(copiedWidgets[0].parameterId, copiedState.config.parameters[0].id);
+  assert.equal(copiedWidgets[0].height, 2);
   assert.notEqual(copiedWidgets[0].id, 'widget-value');
   assert.equal(copiedWidgets[1].buttonId, copiedState.config.rules[0].eventSource.id);
   assert.equal((await repository.listProjectOperationHistory(database, imported.id)).length, 1);
