@@ -9,8 +9,9 @@ const repository = require('../.test-build/storage/projectRepository.js');
 const engine = require('../.test-build/engine/index.js');
 
 class NodeSqliteAdapter {
-  constructor(filename) {
+  constructor(filename, { webMode = false } = {}) {
     this.raw = new DatabaseSync(filename);
+    this.webMode = webMode;
   }
 
   async execAsync(sql) {
@@ -34,6 +35,17 @@ class NodeSqliteAdapter {
   }
 
   async withExclusiveTransactionAsync(callback) {
+    if (this.webMode) {
+      throw new Error('withExclusiveTransactionAsync is not supported on web');
+    }
+    return this.runTransaction(callback);
+  }
+
+  async withTransactionAsync(callback) {
+    return this.runTransaction(callback);
+  }
+
+  async runTransaction(callback) {
     this.raw.exec('BEGIN EXCLUSIVE;');
     try {
       const result = await callback(this);
@@ -86,6 +98,34 @@ test('creates and reads a project with its initial screen', async () => {
   const state = await repository.loadProjectEngineState(database, created.id);
   assert.deepEqual(state.config, { parameters: [], rules: [] });
   assert.equal(state.revision, 0);
+});
+
+test('creates a project with the web-compatible transaction API', async () => {
+  const webDatabase = new NodeSqliteAdapter(join(directory, 'web.db'), { webMode: true });
+  try {
+    await repository.initializeProjectDatabase(webDatabase);
+    const [created, second] = await Promise.all([
+      repository.createProject(webDatabase, {
+        name: 'Browser project',
+        description: 'Saved from web',
+      }),
+      repository.createProject(webDatabase, {
+        name: 'Second browser project',
+        description: '',
+      }),
+    ]);
+
+    const loaded = await repository.listProjects(webDatabase);
+    const createdProject = loaded.find((project) => project.id === created.id);
+    assert.ok(createdProject);
+    assert.ok(loaded.some((project) => project.id === second.id));
+    assert.equal(createdProject.name, 'Browser project');
+    assert.equal(createdProject.description, 'Saved from web');
+    assert.equal(createdProject.screens.length, 1);
+    assert.equal((await repository.loadProjectEngineState(webDatabase, created.id)).revision, 0);
+  } finally {
+    webDatabase.close();
+  }
 });
 
 test('configuration, operation state, and successful history commit atomically', async () => {

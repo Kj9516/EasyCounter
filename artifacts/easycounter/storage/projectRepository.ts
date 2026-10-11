@@ -55,6 +55,38 @@ function requireName(name: string, label: string): string {
   return normalized;
 }
 
+let webTransactionQueue: Promise<void> = Promise.resolve();
+
+async function withProjectTransaction(
+  db: SQLiteDatabase,
+  task: (transaction: SQLiteDatabase) => Promise<void>,
+): Promise<void> {
+  let taskStarted = false;
+  try {
+    await db.withExclusiveTransactionAsync(async (transaction) => {
+      taskStarted = true;
+      await task(transaction);
+    });
+  } catch (error) {
+    const exclusiveTransactionsUnsupported =
+      !taskStarted &&
+      error instanceof Error &&
+      error.message === 'withExclusiveTransactionAsync is not supported on web';
+    if (!exclusiveTransactionsUnsupported) throw error;
+
+    // Web SQLite has one connection, so use its supported transaction API and
+    // serialize repository writes to prevent overlapping transactions.
+    const run = webTransactionQueue.then(() =>
+      db.withTransactionAsync(() => task(db)),
+    );
+    webTransactionQueue = run.then(
+      () => undefined,
+      () => undefined,
+    );
+    await run;
+  }
+}
+
 export async function initializeProjectDatabase(
   db: SQLiteDatabase,
 ): Promise<void> {
@@ -64,7 +96,7 @@ export async function initializeProjectDatabase(
   );
 
   if ((version?.user_version ?? 0) < 1) {
-    await db.withExclusiveTransactionAsync(async (transaction) => {
+    await withProjectTransaction(db, async (transaction) => {
       await transaction.execAsync(`
         CREATE TABLE IF NOT EXISTS projects (
           id TEXT PRIMARY KEY NOT NULL,
@@ -92,7 +124,7 @@ export async function initializeProjectDatabase(
 
   const currentVersion = await db.getFirstAsync<{ user_version: number }>('PRAGMA user_version;');
   if ((currentVersion?.user_version ?? 0) < 2) {
-    await db.withExclusiveTransactionAsync(async (transaction) => {
+    await withProjectTransaction(db, async (transaction) => {
       await transaction.execAsync(`
         CREATE TABLE IF NOT EXISTS project_engine_state (
           project_id TEXT PRIMARY KEY NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
@@ -187,7 +219,7 @@ export async function createProject(
     ],
   };
 
-  await db.withExclusiveTransactionAsync(async (transaction) => {
+  await withProjectTransaction(db, async (transaction) => {
     await transaction.runAsync(
       'INSERT INTO projects (id, name, description, created_at, updated_at) VALUES (?, ?, ?, ?, ?);',
       project.id,
@@ -240,7 +272,7 @@ export async function duplicateProject(
     })),
   };
 
-  await db.withExclusiveTransactionAsync(async (transaction) => {
+  await withProjectTransaction(db, async (transaction) => {
     await transaction.runAsync(
       'INSERT INTO projects (id, name, description, created_at, updated_at) VALUES (?, ?, ?, ?, ?);',
       duplicate.id,
@@ -296,7 +328,7 @@ export async function deleteProject(
   db: SQLiteDatabase,
   projectId: string,
 ): Promise<void> {
-  await db.withExclusiveTransactionAsync(async (transaction) => {
+  await withProjectTransaction(db, async (transaction) => {
     await transaction.runAsync('DELETE FROM projects WHERE id = ?;', projectId);
   });
 }
@@ -314,7 +346,7 @@ export async function createProjectScreen(
     createdAt: new Date().toISOString(),
   };
 
-  await db.withExclusiveTransactionAsync(async (transaction) => {
+  await withProjectTransaction(db, async (transaction) => {
     const project = await transaction.getFirstAsync<{ id: string }>(
       'SELECT id FROM projects WHERE id = ?;',
       projectId,
@@ -360,7 +392,7 @@ export async function deleteProjectScreen(
   projectId: string,
   screenId: string,
 ): Promise<void> {
-  await db.withExclusiveTransactionAsync(async (transaction) => {
+  await withProjectTransaction(db, async (transaction) => {
     await transaction.runAsync(
       'DELETE FROM project_screens WHERE id = ? AND project_id = ?;',
       screenId,
@@ -391,7 +423,7 @@ export async function saveProjectEngineConfiguration(
   // Initialize and validate before opening the transaction so invalid edits never replace saved data.
   const now = new Date().toISOString();
   let savedState: ProjectState | undefined;
-  await db.withExclusiveTransactionAsync(async (transaction) => {
+  await withProjectTransaction(db, async (transaction) => {
     const current = await transaction.getFirstAsync<EngineStateRow>(
       'SELECT project_id, configuration_json, runtime_json, revision FROM project_engine_state WHERE project_id = ?;',
       projectId,
@@ -421,7 +453,7 @@ export async function commitEngineExecution(
   if (execution.status !== 'completed') throw new Error('Only completed operations can be committed.');
   const now = new Date().toISOString();
   let committedState: ProjectState | undefined;
-  await db.withExclusiveTransactionAsync(async (transaction) => {
+  await withProjectTransaction(db, async (transaction) => {
     const current = await transaction.getFirstAsync<EngineStateRow>(
       'SELECT project_id, configuration_json, runtime_json, revision FROM project_engine_state WHERE project_id = ?;',
       projectId,
