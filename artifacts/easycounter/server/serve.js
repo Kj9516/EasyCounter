@@ -127,6 +127,10 @@ const landingPageTemplate = fs.readFileSync(TEMPLATE_PATH, 'utf-8');
 const appName = getAppName();
 
 const server = http.createServer((req, res) => {
+  // Keep expo-sqlite's WASM worker functional in production web previews.
+  res.setHeader('Cross-Origin-Embedder-Policy', 'credentialless');
+  res.setHeader('Cross-Origin-Opener-Policy', 'same-origin');
+
   const url = new URL(req.url || '/', `http://${req.headers.host}`);
   let pathname = url.pathname;
 
