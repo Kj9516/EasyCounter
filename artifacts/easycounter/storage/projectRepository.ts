@@ -26,6 +26,40 @@ interface EngineStateRow {
   revision: number;
 }
 
+export interface ScreenWidget {
+  id: string;
+  type: 'value' | 'button' | 'input' | 'toggle' | 'select' | 'indicator' | 'container' | 'text';
+  title: string;
+  parameterId?: string;
+  buttonId?: string;
+  screenId: string;
+  position: number;
+  span?: 1 | 2;
+  visibleWhen?: string;
+  titleExpression?: string;
+  colorExpression?: string;
+  optionsJson?: string;
+  parentId?: string;
+  accessibilityLabel?: string;
+}
+
+export interface ScreenWidgetRow {
+  id: string;
+  type: ScreenWidget['type'];
+  title: string;
+  parameter_id: string | null;
+  button_id: string | null;
+  screen_id: string;
+  position: number;
+  span: number;
+  visible_when: string | null;
+  title_expression: string | null;
+  color_expression: string | null;
+  options_json: string | null;
+  parent_id: string | null;
+  accessibility_label: string | null;
+}
+
 export interface OperationHistoryEntry {
   id: number;
   projectId: string;
@@ -33,6 +67,7 @@ export interface OperationHistoryEntry {
   rootEvent: ExecutionResult['rootEvent'];
   changes: ExecutionResult['changes'];
   revision: number;
+  messages: string[];
 }
 
 function parseJson<T>(value: string, label: string): T {
@@ -122,6 +157,150 @@ export async function initializeProjectDatabase(
       await transaction.execAsync('PRAGMA user_version = 2;');
     });
   }
+
+  const latestVersion = await db.getFirstAsync<{ user_version: number }>('PRAGMA user_version;');
+  if ((latestVersion?.user_version ?? 0) < 3) {
+    await db.withExclusiveTransactionAsync(async (transaction) => {
+      await transaction.execAsync(`
+        CREATE TABLE IF NOT EXISTS screen_widgets (
+          id TEXT PRIMARY KEY NOT NULL,
+          project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+          screen_id TEXT NOT NULL REFERENCES project_screens(id) ON DELETE CASCADE,
+          type TEXT NOT NULL CHECK(type IN ('value', 'button')),
+          title TEXT NOT NULL,
+          parameter_id TEXT,
+          button_id TEXT,
+          position INTEGER NOT NULL DEFAULT 0,
+          CHECK((type = 'value' AND parameter_id IS NOT NULL AND button_id IS NULL)
+             OR (type = 'button' AND parameter_id IS NULL AND button_id IS NOT NULL))
+        );
+        CREATE INDEX IF NOT EXISTS screen_widgets_screen_position ON screen_widgets(screen_id, position);
+        PRAGMA user_version = 3;
+      `);
+    });
+  }
+
+  const widgetVersion = await db.getFirstAsync<{ user_version: number }>('PRAGMA user_version;');
+  if ((widgetVersion?.user_version ?? 0) < 4) {
+    await db.withExclusiveTransactionAsync(async (transaction) => {
+      await transaction.execAsync(`ALTER TABLE screen_widgets ADD COLUMN span INTEGER NOT NULL DEFAULT 1 CHECK(span IN (1, 2)); PRAGMA user_version = 4;`);
+    });
+  }
+  const dynamicVersion = await db.getFirstAsync<{ user_version: number }>('PRAGMA user_version;');
+  if ((dynamicVersion?.user_version ?? 0) < 5) {
+    await db.withExclusiveTransactionAsync(async (transaction) => {
+      await transaction.execAsync(`ALTER TABLE screen_widgets ADD COLUMN visible_when TEXT; PRAGMA user_version = 5;`);
+    });
+  }
+  const styleVersion = await db.getFirstAsync<{ user_version: number }>('PRAGMA user_version;');
+  if ((styleVersion?.user_version ?? 0) < 6) {
+    await db.withExclusiveTransactionAsync(async (transaction) => {
+      await transaction.execAsync(`ALTER TABLE screen_widgets ADD COLUMN title_expression TEXT; ALTER TABLE screen_widgets ADD COLUMN color_expression TEXT; PRAGMA user_version = 6;`);
+    });
+  }
+  const kindsVersion = await db.getFirstAsync<{ user_version: number }>('PRAGMA user_version;');
+  if ((kindsVersion?.user_version ?? 0) < 7) {
+    await db.withExclusiveTransactionAsync(async (transaction) => {
+      await transaction.execAsync(`
+        CREATE TABLE screen_widgets_v7 (
+          id TEXT PRIMARY KEY NOT NULL,
+          project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+          screen_id TEXT NOT NULL REFERENCES project_screens(id) ON DELETE CASCADE,
+          type TEXT NOT NULL CHECK(type IN ('value', 'button', 'input', 'toggle', 'select', 'indicator', 'container', 'text')),
+          title TEXT NOT NULL,
+          parameter_id TEXT,
+          button_id TEXT,
+          position INTEGER NOT NULL DEFAULT 0,
+          span INTEGER NOT NULL DEFAULT 1 CHECK(span IN (1, 2)),
+          visible_when TEXT,
+          title_expression TEXT,
+          color_expression TEXT,
+          CHECK(
+            (type IN ('value', 'indicator') AND parameter_id IS NOT NULL AND button_id IS NULL)
+            OR (type = 'button' AND parameter_id IS NULL AND button_id IS NOT NULL)
+            OR (type IN ('input', 'toggle', 'select') AND parameter_id IS NOT NULL AND button_id IS NOT NULL)
+            OR (type IN ('container', 'text') AND parameter_id IS NULL AND button_id IS NULL)
+          )
+        );
+        INSERT INTO screen_widgets_v7 (id, project_id, screen_id, type, title, parameter_id, button_id, position, span, visible_when, title_expression, color_expression)
+          SELECT id, project_id, screen_id, type, title, parameter_id, button_id, position, span, visible_when, title_expression, color_expression FROM screen_widgets;
+        DROP TABLE screen_widgets;
+        ALTER TABLE screen_widgets_v7 RENAME TO screen_widgets;
+        CREATE INDEX screen_widgets_screen_position ON screen_widgets(screen_id, position);
+        PRAGMA user_version = 7;
+      `);
+    });
+  }
+  const optionsVersion = await db.getFirstAsync<{ user_version: number }>('PRAGMA user_version;');
+  if ((optionsVersion?.user_version ?? 0) < 8) {
+    await db.withExclusiveTransactionAsync(async (transaction) => {
+      await transaction.execAsync(`ALTER TABLE screen_widgets ADD COLUMN options_json TEXT; PRAGMA user_version = 8;`);
+    });
+  }
+  const parentVersion = await db.getFirstAsync<{ user_version: number }>('PRAGMA user_version;');
+  if ((parentVersion?.user_version ?? 0) < 9) {
+    await db.withExclusiveTransactionAsync(async (transaction) => {
+      await transaction.execAsync(`ALTER TABLE screen_widgets ADD COLUMN parent_id TEXT; PRAGMA user_version = 9;`);
+    });
+  }
+  const accessibilityVersion = await db.getFirstAsync<{ user_version: number }>('PRAGMA user_version;');
+  if ((accessibilityVersion?.user_version ?? 0) < 10) {
+    await db.withExclusiveTransactionAsync(async (transaction) => {
+      await transaction.execAsync(`ALTER TABLE screen_widgets ADD COLUMN accessibility_label TEXT; PRAGMA user_version = 10;`);
+    });
+  }
+  const verifiedVersion = await db.getFirstAsync<{ user_version: number }>('PRAGMA user_version;');
+  if ((verifiedVersion?.user_version ?? 0) < 10) throw new Error('Не удалось обновить структуру виджетов до версии 10.');
+}
+
+export async function listScreenWidgets(db: SQLiteDatabase, projectId: string, screenId: string): Promise<ScreenWidget[]> {
+  const rows = await db.getAllAsync<ScreenWidgetRow>(
+    'SELECT id, type, title, parameter_id, button_id, screen_id, position, span, visible_when, title_expression, color_expression, options_json, parent_id, accessibility_label FROM screen_widgets WHERE project_id = ? AND screen_id = ? ORDER BY position, id;',
+    projectId, screenId,
+  );
+  return rows.map((row) => ({ id: row.id, type: row.type, title: row.title, screenId: row.screen_id, position: row.position, span: row.span === 2 ? 2 : 1, ...(row.visible_when ? { visibleWhen: row.visible_when } : {}), ...(row.title_expression ? { titleExpression: row.title_expression } : {}), ...(row.color_expression ? { colorExpression: row.color_expression } : {}), ...(row.options_json ? { optionsJson: row.options_json } : {}), ...(row.parent_id ? { parentId: row.parent_id } : {}), ...(row.accessibility_label ? { accessibilityLabel: row.accessibility_label } : {}), ...(row.parameter_id ? { parameterId: row.parameter_id } : {}), ...(row.button_id ? { buttonId: row.button_id } : {}) }));
+}
+
+export async function saveScreenWidgets(db: SQLiteDatabase, projectId: string, screenId: string, widgets: ScreenWidget[]): Promise<void> {
+  await db.withExclusiveTransactionAsync(async (transaction) => {
+    const screen = await transaction.getFirstAsync<{ id: string }>(
+      'SELECT id FROM project_screens WHERE id = ? AND project_id = ?;', screenId, projectId,
+    );
+    if (!screen) throw new Error('Экран больше не существует.');
+    const containers = new Set(widgets.filter((widget) => widget.type === 'container').map((widget) => widget.id));
+    const ids = new Set<string>();
+    const screenEngine = await transaction.getFirstAsync<{ configuration_json: string }>(
+      'SELECT configuration_json FROM project_engine_state WHERE project_id = ?;', projectId,
+    );
+    const screenConfiguration = screenEngine ? parseJson<ProjectConfiguration>(screenEngine.configuration_json, 'конфигурацию проекта') : { parameters: [], rules: [] };
+    const parameterIds = new Set(screenConfiguration.parameters.map((parameter) => parameter.id));
+    for (const widget of widgets) {
+      if (!widget.id.trim() || ids.has(widget.id)) throw new Error('У каждого виджета должен быть уникальный непустой ID.');
+      ids.add(widget.id);
+      if (widget.parentId && (!containers.has(widget.parentId) || widget.parentId === widget.id)) throw new Error('Родителем виджета может быть только другой контейнер.');
+      if (widget.parentId && widget.type === 'container') throw new Error('Контейнеры нельзя вкладывать друг в друга.');
+      if (widget.parameterId && !parameterIds.has(widget.parameterId)) throw new Error(`Параметр виджета ${widget.title} больше не существует.`);
+      const linkedParameter = widget.parameterId ? screenConfiguration.parameters.find((parameter) => parameter.id === widget.parameterId) : undefined;
+      if (widget.type === 'value' && !widget.parameterId) throw new Error(`Для виджета ${widget.title} требуется параметр.`);
+      if (widget.type === 'button' && !widget.buttonId) throw new Error(`Для кнопки ${widget.title} требуется идентификатор действия.`);
+      if (['input', 'toggle', 'select'].includes(widget.type) && (!widget.parameterId || !widget.buttonId)) throw new Error(`Виджету ${widget.title} нужны параметр и идентификатор действия.`);
+      if (widget.type === 'indicator' && !widget.parameterId) throw new Error(`Для индикатора ${widget.title} требуется параметр.`);
+      if (widget.type === 'toggle' && linkedParameter?.type !== 'boolean') throw new Error(`Переключателю ${widget.title} нужен параметр типа Да / нет.`);
+      if (widget.type === 'input' && (!linkedParameter || linkedParameter.kind !== 'stored' || linkedParameter.type === 'list' || linkedParameter.type === 'timer')) throw new Error(`Поле ввода ${widget.title} связано с неподдерживаемым параметром.`);
+      if (widget.type === 'select' && (!linkedParameter || linkedParameter.kind !== 'stored' || linkedParameter.type === 'list' || linkedParameter.type === 'timer')) throw new Error(`Выбор ${widget.title} связан с неподдерживаемым параметром.`);
+      if (widget.type === 'select' && (!widget.optionsJson || JSON.parse(widget.optionsJson).length < 2)) throw new Error(`Для выбора ${widget.title} нужно указать минимум два варианта.`);
+      if (['container', 'text'].includes(widget.type) && (widget.parameterId || widget.buttonId)) throw new Error(`Виджет ${widget.title} не поддерживает привязку параметра или кнопки.`);
+      if (widget.span !== undefined && widget.span !== 1 && widget.span !== 2) throw new Error('Ширина виджета должна занимать одну или две колонки.');
+      if (widget.optionsJson) { let options: unknown; try { options = JSON.parse(widget.optionsJson); } catch { throw new Error(`Некорректные варианты виджета ${widget.title}.`); } if (!Array.isArray(options) || options.some((option) => typeof option !== 'string')) throw new Error(`Варианты виджета ${widget.title} должны быть списком строк.`); }
+    }
+    await transaction.runAsync('DELETE FROM screen_widgets WHERE project_id = ? AND screen_id = ?;', projectId, screenId);
+    for (const [position, widget] of widgets.entries()) {
+      await transaction.runAsync(
+        'INSERT INTO screen_widgets (id, project_id, screen_id, type, title, parameter_id, button_id, position, span, visible_when, title_expression, color_expression, options_json, parent_id, accessibility_label) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);',
+        widget.id, projectId, screenId, widget.type, widget.title.trim(), widget.parameterId ?? null, widget.buttonId ?? null, position, widget.span ?? 1, widget.visibleWhen ?? null, widget.titleExpression ?? null, widget.colorExpression ?? null, widget.optionsJson ?? null, widget.parentId ?? null, widget.accessibilityLabel ?? null,
+      );
+    }
+  });
 }
 
 function buildProjects(
@@ -387,6 +566,7 @@ export async function saveProjectEngineConfiguration(
   db: SQLiteDatabase,
   projectId: string,
   configuration: ProjectConfiguration,
+  resetParameterIds: string[] = [],
 ): Promise<ProjectState> {
   // Initialize and validate before opening the transaction so invalid edits never replace saved data.
   const now = new Date().toISOString();
@@ -398,6 +578,11 @@ export async function saveProjectEngineConfiguration(
     );
     if (!current) throw new Error('Не удалось найти состояние проекта.');
     const oldRuntime = parseJson<RuntimeState>(current.runtime_json, 'состояние параметров');
+    for (const id of resetParameterIds) {
+      const updatedParameter = configuration.parameters.find((parameter) => parameter.id === id);
+      if (!updatedParameter) throw new Error(`Не найден изменяемый параметр ${id}.`);
+      oldRuntime.values[id] = updatedParameter.initialValue;
+    }
     const revision = current.revision + 1;
     const next = rehydrateProjectState(configuration, oldRuntime, revision);
     await transaction.runAsync(
@@ -420,6 +605,7 @@ export async function commitEngineExecution(
 ): Promise<ProjectState> {
   if (execution.status !== 'completed') throw new Error('Only completed operations can be committed.');
   const now = new Date().toISOString();
+  const historyEvent = { ...execution.rootEvent, messages: execution.messages };
   let committedState: ProjectState | undefined;
   await db.withExclusiveTransactionAsync(async (transaction) => {
     const current = await transaction.getFirstAsync<EngineStateRow>(
@@ -441,7 +627,7 @@ export async function commitEngineExecution(
       'INSERT INTO project_operation_history (project_id, occurred_at, root_event_json, changes_json, revision) VALUES (?, ?, ?, ?, ?);',
       projectId,
       execution.rootEvent.occurredAt ?? now,
-      JSON.stringify(execution.rootEvent),
+      JSON.stringify(historyEvent),
       JSON.stringify(execution.changes),
       revision,
     );
@@ -467,5 +653,10 @@ export async function listProjectOperationHistory(
     rootEvent: parseJson<ExecutionResult['rootEvent']>(row.root_event_json, 'событие истории'),
     changes: parseJson<ExecutionResult['changes']>(row.changes_json, 'изменения истории'),
     revision: row.revision,
+    messages: ((parseJson<ExecutionResult['rootEvent']>(row.root_event_json, 'событие истории') as ExecutionResult['rootEvent'] & { messages?: string[] }).messages ?? []),
   }));
+}
+
+export async function clearProjectOperationHistory(db: SQLiteDatabase, projectId: string): Promise<void> {
+  await db.runAsync('DELETE FROM project_operation_history WHERE project_id = ?;', projectId);
 }

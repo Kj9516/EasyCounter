@@ -35,7 +35,7 @@ function assignable(source: ExpressionType, target: Parameter): boolean {
 }
 
 function eventParameterFor(config: ProjectConfiguration, source: Action | { type: 'button' } | { type: 'changed' | 'assigned'; parameterId: string }): Parameter | undefined {
-  if (source.type === 'button') return undefined;
+  if (source.type === 'button' || source.type === 'message' || source.type === 'input') return undefined;
   return config.parameters.find((parameter) => parameter.id === source.parameterId);
 }
 
@@ -83,10 +83,11 @@ function checkExpression(
   parameterMap: ReadonlyMap<string, Parameter>,
   eventParameter: Parameter | undefined,
   label: string,
+  variables: ReadonlyMap<string, ExpressionType> = new Map(),
 ): ExpressionType {
   validateAstBounds(expression, label);
   try {
-    return inferExpressionType(expression, parameterMap, eventParameter);
+    return inferExpressionType(expression, parameterMap, eventParameter, variables);
   } catch (error) {
     throw new ConfigurationValidationError(
       `${label}: ${error instanceof Error ? error.message : String(error)}`,
@@ -101,8 +102,28 @@ function validateAction(
   index: number,
   parameterMap: ReadonlyMap<string, Parameter>,
   eventParameter?: Parameter,
+  variables: ReadonlyMap<string, ExpressionType> = new Map(),
 ): void {
   const label = `Rule ${ruleId}, action ${index + 1}`;
+  if (action.type === 'message') {
+    if (typeof action.text !== 'string' || action.text.length > 2000) throw new ConfigurationValidationError(`${label}: message text must be at most 2000 characters`, { ruleId });
+    return;
+  }
+  if (action.type === 'input') {
+    if (action.variableName !== undefined) {
+      if (action.parameterId !== undefined) throw new ConfigurationValidationError(`${label}: input cannot target both a parameter and a temporary variable`, { ruleId });
+      if (!/^[\p{L}_][\p{L}\p{N}_]*$/u.test(action.variableName) || !action.variableType || action.variableType === 'timer') throw new ConfigurationValidationError(`${label}: invalid temporary variable name or type`, { ruleId });
+      if (variables.has(`__local_${action.variableName}`) || parameterMap.has(`__local_${action.variableName}`)) throw new ConfigurationValidationError(`${label}: temporary variable ${action.variableName} is already defined`, { ruleId });
+      if (typeof action.prompt !== 'string' || action.prompt.length > 500) throw new ConfigurationValidationError(`${label}: input prompt must be at most 500 characters`, { ruleId });
+      return;
+    }
+    const parameter = action.parameterId ? parameterMap.get(action.parameterId) : undefined;
+    if (!parameter) throw new ConfigurationValidationError(`${label}: unknown parameter ${action.parameterId}`, { ruleId, parameterId: action.parameterId });
+    if (parameter.kind === 'computed') throw new ConfigurationValidationError(`${label}: computed parameters are read-only`, { ruleId, parameterId: parameter.id });
+    if (parameter.type === 'list' || parameter.type === 'timer') throw new ConfigurationValidationError(`${label}: input is not supported for ${parameter.type}`, { ruleId, parameterId: parameter.id });
+    if (typeof action.prompt !== 'string' || action.prompt.length > 500) throw new ConfigurationValidationError(`${label}: input prompt must be at most 500 characters`, { ruleId });
+    return;
+  }
   const parameter = parameterMap.get(action.parameterId);
   if (!parameter) {
     throw new ConfigurationValidationError(`${label}: unknown parameter ${action.parameterId}`, { ruleId, parameterId: action.parameterId });
@@ -111,7 +132,7 @@ function validateAction(
     throw new ConfigurationValidationError(`${label}: computed parameters are read-only`, { ruleId, parameterId: parameter.id });
   }
   if (action.type === 'set') {
-    const valueType = checkExpression(action.expression, parameterMap, eventParameter, label);
+    const valueType = checkExpression(action.expression, parameterMap, eventParameter, label, variables);
     if (!assignable(valueType, parameter)) {
       throw new ConfigurationValidationError(`${label}: cannot assign ${valueType.type} to ${parameter.type}`, { ruleId, parameterId: parameter.id });
     }
@@ -121,7 +142,7 @@ function validateAction(
     if (parameter.type !== 'integer' && parameter.type !== 'decimal') {
       throw new ConfigurationValidationError(`${label}: add requires a numeric parameter`, { ruleId, parameterId: parameter.id });
     }
-    const valueType = checkExpression(action.expression, parameterMap, eventParameter, label);
+    const valueType = checkExpression(action.expression, parameterMap, eventParameter, label, variables);
     if (valueType.type !== 'integer' && valueType.type !== 'decimal') {
       throw new ConfigurationValidationError(`${label}: add requires a numeric expression`, { ruleId, parameterId: parameter.id });
     }
@@ -131,13 +152,13 @@ function validateAction(
     throw new ConfigurationValidationError(`${label}: list operation requires a list parameter`, { ruleId, parameterId: parameter.id });
   }
   if (action.type === 'listAdd' || action.type === 'listReplace') {
-    const valueType = checkExpression(action.expression, parameterMap, eventParameter, label);
+    const valueType = checkExpression(action.expression, parameterMap, eventParameter, label, variables);
     if (valueType.type !== parameter.listItemType) {
       throw new ConfigurationValidationError(`${label}: list item must have type ${parameter.listItemType}`, { ruleId, parameterId: parameter.id });
     }
   }
   if (action.type === 'listRemove' || action.type === 'listReplace') {
-    const indexType = checkExpression(action.index, parameterMap, eventParameter, label);
+    const indexType = checkExpression(action.index, parameterMap, eventParameter, label, variables);
     if (indexType.type !== 'integer') {
       throw new ConfigurationValidationError(`${label}: list index must be an integer`, { ruleId, parameterId: parameter.id });
     }
@@ -240,7 +261,11 @@ export function validateProjectConfiguration(config: ProjectConfiguration): Comp
         throw new ConfigurationValidationError(`Condition for ${rule.name} must return boolean`, { ruleId: rule.id });
       }
     }
-    rule.actions.forEach((action, index) => validateAction(action, rule.id, index, parameterMap, eventParameter));
+    const localTypes = new Map<string, ExpressionType>();
+    rule.actions.forEach((action, index) => {
+      validateAction(action, rule.id, index, parameterMap, eventParameter, localTypes);
+      if (action.type === 'input' && action.variableName && action.variableType) localTypes.set(`__local_${action.variableName}`, { type: action.variableType });
+    });
   }
   return computed;
 }

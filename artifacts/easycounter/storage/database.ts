@@ -1,7 +1,7 @@
 import * as SQLite from 'expo-sqlite';
 import type { Project, ProjectDraft, ProjectScreen } from '../types/project';
 import type { ExecutionResult, ProjectConfiguration, ProjectState } from '../engine/types';
-import type { OperationHistoryEntry } from './projectRepository';
+import type { OperationHistoryEntry, ScreenWidget } from './projectRepository';
 import {
   createProject as insertProject,
   createProjectScreen as insertProjectScreen,
@@ -13,6 +13,9 @@ import {
   saveProjectEngineConfiguration as saveEngineConfiguration,
   commitEngineExecution as persistEngineExecution,
   listProjectOperationHistory as readProjectOperationHistory,
+  clearProjectOperationHistory as clearStoredOperationHistory,
+  listScreenWidgets as readScreenWidgets,
+  saveScreenWidgets as persistScreenWidgets,
   listProjects as readProjects,
   renameProjectScreen as renameStoredProjectScreen,
   updateProject as updateStoredProject,
@@ -43,8 +46,9 @@ export async function loadProjectEngineState(projectId: string): Promise<Project
 export async function saveProjectEngineConfiguration(
   projectId: string,
   configuration: ProjectConfiguration,
+  resetParameterIds: string[] = [],
 ): Promise<ProjectState> {
-  return saveEngineConfiguration(await getDatabase(), projectId, configuration);
+  return saveEngineConfiguration(await getDatabase(), projectId, configuration, resetParameterIds);
 }
 
 export async function commitEngineExecution(
@@ -56,6 +60,18 @@ export async function commitEngineExecution(
 
 export async function listProjectOperationHistory(projectId: string): Promise<OperationHistoryEntry[]> {
   return readProjectOperationHistory(await getDatabase(), projectId);
+}
+
+export async function clearProjectOperationHistory(projectId: string): Promise<void> {
+  return clearStoredOperationHistory(await getDatabase(), projectId);
+}
+
+export async function listScreenWidgets(projectId: string, screenId: string): Promise<ScreenWidget[]> {
+  return readScreenWidgets(await getDatabase(), projectId, screenId);
+}
+
+export async function saveScreenWidgets(projectId: string, screenId: string, widgets: ScreenWidget[]): Promise<void> {
+  return persistScreenWidgets(await getDatabase(), projectId, screenId, widgets);
 }
 
 export async function listProjects(): Promise<Project[]> {

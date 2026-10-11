@@ -57,6 +57,7 @@ function copyConfig(config: ProjectConfiguration): ProjectConfiguration {
 }
 
 function copyAction(action: Action): Action {
+  if (action.type === 'message' || action.type === 'input') return { ...action };
   if (action.type === 'listRemove') return { ...action, index: copyExpression(action.index) };
   if (action.type === 'listReplace') {
     return { ...action, index: copyExpression(action.index), expression: copyExpression(action.expression) };
@@ -117,6 +118,7 @@ export function execute(
     ruleTruth: { ...baseState.runtime.ruleTruth },
   };
   const parameters = new Map(config.parameters.map((parameter) => [parameter.id, parameter] as const));
+  const localValues = new Map<string, Value>();
   const rules = config.rules
     .filter((rule) => rule.enabled)
     .map((rule, originalIndex) => ({ rule, originalIndex }))
@@ -133,19 +135,78 @@ export function execute(
   const queue: EngineEvent[] = [rootEvent];
   const processedEvents: EngineEvent[] = [];
   const changes: Change[] = [];
+  const messages: string[] = [];
   let eventIndex = 0;
   let ruleIndex = 0;
   let actionIndex = 0;
   let selectedRule = false;
   let cancelled = false;
+  let pendingInput: { parameterId?: string; variableName?: string; variableType?: import('./types').ScalarType; prompt: string; ruleId: string; ruleName: string } | undefined;
+
+  function evaluationValues(): Map<string, Value> {
+    const values = currentValues(runtime);
+    for (const [name, value] of localValues) values.set(name, copyValue(value));
+    return values;
+  }
 
   const session: SuspendedExecution = {
     status: 'suspended',
-    continue: (maxActions = options.maxActionsPerSlice ?? DEFAULT_ACTIONS_PER_SLICE) => run(maxActions),
+    get reason() { return pendingInput ? 'input' : 'yield'; },
+    get inputRequest() {
+      if (!pendingInput) return undefined;
+      if (pendingInput.variableName) return { variableName: pendingInput.variableName, parameterType: pendingInput.variableType!, prompt: pendingInput.prompt };
+      const parameter = parameters.get(pendingInput.parameterId!)!;
+      return { parameterId: parameter.id, parameterName: parameter.name, parameterType: parameter.type, prompt: pendingInput.prompt };
+    },
+    continue: (maxActions = options.maxActionsPerSlice ?? DEFAULT_ACTIONS_PER_SLICE) => {
+      if (pendingInput) throw new Error('Execution is waiting for input. Call submitInput or cancel.');
+      return run(maxActions);
+    },
+    submitInput: (value, maxActions = options.maxActionsPerSlice ?? DEFAULT_ACTIONS_PER_SLICE) => {
+      if (cancelled) throw new Error('Execution was cancelled');
+      if (!pendingInput) throw new Error('Execution is not waiting for input.');
+      const request = pendingInput;
+      if (request.variableName) {
+        try {
+          localValues.set(`__local_${request.variableName}`, canonicalizeValue(value, request.variableType));
+          actionIndex++;
+          pendingInput = undefined;
+          return run(maxActions);
+        } catch (error) {
+          throw new EngineExecutionError(`Ввод для временной переменной «${request.variableName}»: ${error instanceof Error ? error.message : String(error)}`, { ruleId: request.ruleId, ruleName: request.ruleName }, { cause: error });
+        }
+      }
+      const parameter = parameters.get(request.parameterId!);
+      if (cancelled) throw new Error('Execution was cancelled');
+      if (!parameter) throw new Error('Input parameter no longer exists.');
+      try {
+        const canonical = canonicalizeValue(value, parameter.type, parameter.listItemType);
+        const inputRule = rules.find((rule) => rule.id === request.ruleId);
+        const inputAction = inputRule?.actions[actionIndex];
+        if (!inputAction || inputAction.type !== 'input') throw new Error('Pending input action is missing.');
+        const oldValue = copyValue(runtime.values[parameter.id]);
+        const valueChanged = !sameValue(oldValue, canonical);
+        const at = new Date().toISOString();
+        runtime.values[parameter.id] = canonical;
+        if (valueChanged) {
+          changes.push({ parameterId: parameter.id, oldValue, newValue: canonical, ruleId: request.ruleId, occurredAt: at });
+          queue.push({ type: 'changed', sourceId: parameter.id, occurredAt: at, oldValue, newValue: canonical });
+          emitComputedChanges(request.ruleId, at);
+        }
+        queue.push({ type: 'assigned', sourceId: parameter.id, occurredAt: at, oldValue, newValue: canonical });
+        actionIndex++;
+        pendingInput = undefined;
+        return run(maxActions);
+      } catch (error) {
+        if (error instanceof EngineExecutionError) throw error;
+        throw new EngineExecutionError(`Ввод для параметра «${parameter.name}»: ${error instanceof Error ? error.message : String(error)}`, { ruleId: request.ruleId, ruleName: request.ruleName, parameterId: parameter.id }, { cause: error });
+      }
+    },
     cancel: () => {
       cancelled = true;
       runtime.values = {};
       runtime.ruleTruth = {};
+      localValues.clear();
       queue.length = 0;
       processedEvents.length = 0;
       changes.length = 0;
@@ -213,21 +274,40 @@ export function execute(
     }
   }
 
+  function applyRootAssignment(): void {
+    if (rootEvent.type !== 'assigned') return;
+    const parameter = parameters.get(rootEvent.sourceId);
+    if (!parameter) throw new Error(`Unknown parameter ${rootEvent.sourceId}`);
+    if (parameter.kind === 'computed') throw new Error(`Computed parameter ${parameter.id} is read-only`);
+    if (!rootEvent.newValue) throw new Error('An assigned root event requires a value');
+    const next = canonicalizeValue(rootEvent.newValue, parameter.type, parameter.listItemType);
+    rootEvent.oldValue = copyValue(runtime.values[parameter.id]);
+    rootEvent.newValue = copyValue(next);
+    applyChange(parameter, next, null, rootEvent.occurredAt!);
+  }
+
   function evaluateCondition(rule: Rule, event: EngineEvent): boolean {
     if (!rule.condition) return true;
-    const result = evaluate(rule.condition, currentValues(runtime), event);
+    const result = evaluate(rule.condition, evaluationValues(), event);
     if (result.type !== 'boolean') throw new Error('Rule condition must be boolean');
     return result.value;
   }
 
   function runAction(rule: Rule, action: Action, event: EngineEvent): void {
+    if (action.type === 'message') { messages.push(action.text); return; }
+    if (action.type === 'input') {
+      pendingInput = action.variableName
+        ? { variableName: action.variableName, variableType: action.variableType, prompt: action.prompt, ruleId: rule.id, ruleName: rule.name }
+        : { parameterId: action.parameterId!, prompt: action.prompt, ruleId: rule.id, ruleName: rule.name };
+      return;
+    }
     const parameter = parameters.get(action.parameterId);
     if (!parameter) throw new Error(`Unknown parameter ${action.parameterId}`);
     if (parameter.kind === 'computed') throw new Error(`Computed parameter ${parameter.id} is read-only`);
     const before = runtime.values[parameter.id];
     if (!before) throw new Error(`Parameter ${parameter.id} has no runtime value`);
-    const values = currentValues(runtime);
-    const evaluated = action.type === 'listRemove' ? undefined : evaluate(action.expression, values, event);
+    const values = evaluationValues();
+    const evaluated = action.type === 'listRemove' ? undefined : evaluate(action.expression, currentValues(runtime), event, localValues);
     const at = new Date().toISOString();
     let next: Value;
 
@@ -250,7 +330,7 @@ export function execute(
         const item = canonicalizeValue(evaluated!, parameter.listItemType);
         next = { type: 'list', itemType: parameter.listItemType!, value: [...before.value.map(copyValue) as never[], item as never] };
       } else {
-        const indexValue = evaluate(action.index, values, event);
+        const indexValue = evaluate(action.index, currentValues(runtime), event, localValues);
         const index = parseIndex(indexValue);
         if (index < 0 || index >= before.value.length) throw new Error(`List index ${index} is out of range`);
         const items = before.value.map(copyValue) as never[];
@@ -268,7 +348,10 @@ export function execute(
     let actionsRun = 0;
 
     try {
-      if (eventIndex === 0 && processedEvents.length === 0 && rootEvent.type === 'reset') applyReset();
+      if (eventIndex === 0 && processedEvents.length === 0) {
+        if (rootEvent.type === 'reset') applyReset();
+        if (rootEvent.type === 'assigned') applyRootAssignment();
+      }
       while (eventIndex < queue.length) {
         const event = queue[eventIndex];
         const rule = rules[ruleIndex];
@@ -321,8 +404,9 @@ export function execute(
         const currentIndex = actionIndex;
         try {
           runAction(rule, rule.actions[currentIndex], event);
-          actionIndex++;
           actionsRun++;
+          if (pendingInput) { actionIndex = currentIndex; return session; }
+          actionIndex++;
         } catch (error) {
           throw new EngineExecutionError(
             `Rule ${rule.name} (${rule.id}), action ${currentIndex + 1}: ${error instanceof Error ? error.message : String(error)}`,
@@ -330,7 +414,7 @@ export function execute(
               ruleId: rule.id,
               ruleName: rule.name,
               actionIndex: currentIndex,
-              parameterId: rule.actions[currentIndex].parameterId,
+              parameterId: 'parameterId' in rule.actions[currentIndex] ? rule.actions[currentIndex].parameterId : undefined,
             },
             { cause: error },
           );
@@ -353,10 +437,16 @@ export function execute(
       changes: [...changes],
       events: [...processedEvents],
       eventsProcessed: processedEvents.length,
+      messages: [...messages],
     };
   }
 
-  return run(options.maxActionsPerSlice ?? DEFAULT_ACTIONS_PER_SLICE);
+  try {
+    return run(options.maxActionsPerSlice ?? DEFAULT_ACTIONS_PER_SLICE);
+  } catch (error) {
+    if (error instanceof EngineExecutionError) throw error;
+    throw new EngineExecutionError(error instanceof Error ? error.message : String(error), {}, { cause: error });
+  }
 }
 
 export function resetParameters(

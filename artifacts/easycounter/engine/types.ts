@@ -70,6 +70,8 @@ export type Expr =
     };
 
 export type Action =
+  | { type: 'message'; text: string }
+  | { type: 'input'; parameterId?: string; variableName?: string; variableType?: ScalarType; prompt: string }
   | { type: 'set'; parameterId: string; expression: Expr }
   | { type: 'add'; parameterId: string; expression: Expr }
   | { type: 'listAdd'; parameterId: string; expression: Expr }
@@ -117,6 +119,7 @@ export interface EngineEvent {
   oldValue?: Value;
   newValue?: Value;
   parameterIds?: string[];
+  messages?: string[];
 }
 
 export interface Change {
@@ -136,12 +139,17 @@ export interface ExecutionResult {
   /** Root event followed by every generated event, in FIFO order. */
   events: EngineEvent[];
   eventsProcessed: number;
+  messages: string[];
 }
 
 export interface SuspendedExecution {
   status: 'suspended';
+  reason: 'yield' | 'input';
+  inputRequest?: { parameterId?: string; parameterName?: string; variableName?: string; parameterType: PrimitiveType; prompt: string };
   /** Continue this in-memory operation to the next bounded execution slice. */
   continue: (maxActions?: number) => ExecutionResult | SuspendedExecution;
+  /** Resolve the pending input and continue the same isolated operation. */
+  submitInput: (value: Value, maxActions?: number) => ExecutionResult | SuspendedExecution;
   /** Drop the isolated working copy. No partial state is returned or committed. */
   cancel: () => void;
 }

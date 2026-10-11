@@ -30,6 +30,13 @@ function tokenize(source: string): Token[] {
     }
 
     const start = position;
+    if (current === '$') {
+      const local = /^[\p{L}_][\p{L}\p{N}_]*/u.exec(source.slice(position + 1));
+      if (!local) throw new ExpressionParseError('После $ укажите имя временной переменной', start);
+      tokens.push({ kind: 'reference', text: `__local_${local[0]}`, position: start });
+      position += local[0].length + 1;
+      continue;
+    }
     if (current === '@' && source[position + 1] === '{') {
       const end = source.indexOf('}', position + 2);
       if (end < 0) throw new ExpressionParseError('Не закрыта ссылка на параметр', start);

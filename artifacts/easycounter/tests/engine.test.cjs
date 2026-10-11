@@ -190,6 +190,19 @@ test('long chains suspend in bounded slices and can be cancelled without exposin
   assert.throws(() => suspended.continue(), /cancelled/);
 });
 
+test('root assigned events update stored values before assigned-event rules', () => {
+  const state = createInitialProjectState(config([parameter('N', 0)], [
+    rule('after-assign', { type: 'assigned', parameterId: 'N' }, [
+      { type: 'add', parameterId: 'N', expression: literal(1) },
+    ]),
+  ]));
+  const result = completed(execute(state, { type: 'assigned', sourceId: 'N', newValue: integer(4) }));
+  assert.equal(result.state.runtime.values.N.value, '5');
+  assert.equal(result.changes.length, 2);
+  assert.equal(result.changes[0].ruleId, null);
+  assert.equal(result.changes[1].ruleId, 'after-assign');
+});
+
 test('equal assignments emit assignment events but no changed event', () => {
   const state = createInitialProjectState(config([parameter('A', 4)], [rule('same', { type: 'button', id: 'go' }, [
     { type: 'set', parameterId: 'A', expression: literal(4) },
@@ -213,4 +226,82 @@ test('reset supports all or selected stored parameters and emits normal changes'
   const all = completed(resetParameters(selected.state));
   assert.equal(all.state.runtime.values.A.value, '0');
   assert.equal(all.state.runtime.values.B.value, '2');
+});
+
+test('input action suspends an atomic chain until typed input is submitted', () => {
+  const state = createInitialProjectState(config([parameter('A', 0), parameter('B', 0)], [
+    rule('prompt', { type: 'button', id: 'go' }, [
+      { type: 'add', parameterId: 'A', expression: literal(5) },
+      { type: 'input', parameterId: 'A', prompt: 'Новое значение A' },
+      { type: 'set', parameterId: 'B', expression: reference('A') },
+    ]),
+  ]));
+  const pending = execute(state, button('go'));
+  assert.equal(pending.status, 'suspended');
+  assert.equal(pending.reason, 'input');
+  assert.deepEqual(pending.inputRequest, { parameterId: 'A', parameterName: 'A', parameterType: 'integer', prompt: 'Новое значение A' });
+  assert.equal(state.runtime.values.A.value, '0');
+  assert.throws(() => pending.continue(), /waiting for input/);
+  assert.throws(() => pending.submitInput({ type: 'decimal', value: '2.5' }), /Type mismatch: expected integer/);
+  const completedResult = completed(pending.submitInput(integer(12)));
+  assert.equal(completedResult.state.runtime.values.A.value, '12');
+  assert.equal(completedResult.state.runtime.values.B.value, '12');
+  assert.equal(completedResult.changes[0].oldValue.value, '0');
+  assert.equal(completedResult.changes[0].newValue.value, '5');
+  assert.equal(completedResult.changes[1].newValue.value, '12');
+  assert.equal(state.runtime.values.A.value, '0');
+  assert.equal(state.runtime.values.B.value, '0');
+});
+
+test('cancelling while waiting for input discards the entire draft', () => {
+  const state = createInitialProjectState(config([parameter('A', 0)], [
+    rule('prompt', { type: 'button', id: 'go' }, [
+      { type: 'add', parameterId: 'A', expression: literal(5) },
+      { type: 'input', parameterId: 'A', prompt: 'Значение' },
+    ]),
+  ]));
+  const pending = execute(state, button('go'));
+  assert.equal(pending.status, 'suspended');
+  pending.cancel();
+  assert.throws(() => pending.submitInput(integer(9)), /cancelled/i);
+  assert.equal(state.runtime.values.A.value, '0');
+});
+
+test('temporary input variables are available to following actions but never persisted', () => {
+  const state = createInitialProjectState(config([parameter('A', 0)], [
+    rule('temporary', { type: 'button', id: 'go' }, [
+      { type: 'input', variableName: 'amount', variableType: 'integer', prompt: 'Количество' },
+      { type: 'add', parameterId: 'A', expression: parseExpression('$amount') },
+    ]),
+  ]));
+  const pending = execute(state, button('go'));
+  assert.equal(pending.status, 'suspended');
+  assert.deepEqual(pending.inputRequest, { variableName: 'amount', parameterType: 'integer', prompt: 'Количество' });
+  const result = completed(pending.submitInput(integer(7)));
+  assert.equal(result.state.runtime.values.A.value, '7');
+  assert.equal(result.changes.length, 1);
+  assert.equal(result.changes[0].parameterId, 'A');
+  assert.equal(Object.hasOwn(result.state.runtime.values, '__local_amount'), false);
+});
+
+test('temporary input variables are scoped to later actions and cancellation drops them', () => {
+  assert.throws(() => validateProjectConfiguration(config([parameter('A', 0)], [rule('forward', { type: 'button', id: 'go' }, [
+    { type: 'add', parameterId: 'A', expression: parseExpression('$amount') },
+    { type: 'input', variableName: 'amount', variableType: 'integer', prompt: '?' },
+  ])])), /Unknown parameter or temporary variable/);
+  const state = createInitialProjectState(config([parameter('A', 0)], [rule('temporary', { type: 'button', id: 'go' }, [
+    { type: 'input', variableName: 'amount', variableType: 'integer', prompt: '?' },
+    { type: 'add', parameterId: 'A', expression: parseExpression('$amount') },
+  ])]));
+  const pending = execute(state, button('go'));
+  pending.cancel();
+  assert.equal(state.runtime.values.A.value, '0');
+});
+
+test('input action rejects computed, list, and timer parameters during configuration validation', () => {
+  const list = { id: 'Items', name: 'Items', kind: 'stored', type: 'list', listItemType: 'integer', initialValue: { type: 'list', itemType: 'integer', value: [] } };
+  const timer = { id: 'Timer', name: 'Timer', kind: 'stored', type: 'timer', initialValue: { type: 'timer', value: { elapsedMilliseconds: '0', initialMilliseconds: '0', direction: 'up', status: 'stopped', allowNegative: false } } };
+  assert.throws(() => validateProjectConfiguration(config([parameter('A', 0), { ...parameter('C', 0), kind: 'computed', formula: literal(0) }], [rule('computed', { type: 'button', id: 'go' }, [{ type: 'input', parameterId: 'C', prompt: '?' }])])), /read-only/);
+  assert.throws(() => validateProjectConfiguration(config([list], [rule('list', { type: 'button', id: 'go' }, [{ type: 'input', parameterId: 'Items', prompt: '?' }])])), /not supported for list/);
+  assert.throws(() => validateProjectConfiguration(config([timer], [rule('timer', { type: 'button', id: 'go' }, [{ type: 'input', parameterId: 'Timer', prompt: '?' }])])), /not supported for timer/);
 });

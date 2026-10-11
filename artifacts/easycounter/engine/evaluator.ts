@@ -182,14 +182,17 @@ export function inferExpressionType(
   expression: Expr,
   parameters: ReadonlyMap<string, Parameter>,
   eventParameter?: Parameter,
+  variables: ReadonlyMap<string, ExpressionType> = new Map(),
 ): ExpressionType {
   switch (expression.kind) {
     case 'literal':
       return expressionType(canonicalizeValue(expression.value));
     case 'parameter': {
       const parameter = parameters.get(expression.id);
-      if (!parameter) throw new Error(`Unknown parameter ${expression.id}`);
-      return { type: parameter.type, ...(parameter.type === 'list' ? { listItemType: parameter.listItemType } : {}) };
+      if (parameter) return { type: parameter.type, ...(parameter.type === 'list' ? { listItemType: parameter.listItemType } : {}) };
+      const variable = variables.get(expression.id);
+      if (variable) return variable;
+      throw new Error(`Unknown parameter or temporary variable ${expression.id}`);
     }
     case 'event': {
       if (!eventParameter) throw new Error('Event values are not available in this expression');
@@ -204,7 +207,7 @@ export function inferExpressionType(
       };
     }
     case 'unary': {
-      const operand = inferExpressionType(expression.operand, parameters, eventParameter);
+      const operand = inferExpressionType(expression.operand, parameters, eventParameter, variables);
       if (expression.op === 'not') {
         if (operand.type !== 'boolean') throw new Error('not requires a boolean operand');
         return { type: 'boolean' };
@@ -215,20 +218,20 @@ export function inferExpressionType(
     case 'binary':
       return inferBinaryType(
         expression.op,
-        inferExpressionType(expression.left, parameters, eventParameter),
-        inferExpressionType(expression.right, parameters, eventParameter),
+        inferExpressionType(expression.left, parameters, eventParameter, variables),
+        inferExpressionType(expression.right, parameters, eventParameter, variables),
       );
     case 'call': {
       if (expression.fn === 'if') {
         if (expression.args.length !== 3) throw new Error('if expects three arguments');
-        const condition = inferExpressionType(expression.args[0], parameters, eventParameter);
+        const condition = inferExpressionType(expression.args[0], parameters, eventParameter, variables);
         if (condition.type !== 'boolean') throw new Error('if condition must be boolean');
-        const whenTrue = inferExpressionType(expression.args[1], parameters, eventParameter);
-        const whenFalse = inferExpressionType(expression.args[2], parameters, eventParameter);
+        const whenTrue = inferExpressionType(expression.args[1], parameters, eventParameter, variables);
+        const whenFalse = inferExpressionType(expression.args[2], parameters, eventParameter, variables);
         if (!sameType(whenTrue, whenFalse)) throw new Error('if branches must have the same type');
         return whenTrue;
       }
-      const args = expression.args.map((item) => inferExpressionType(item, parameters, eventParameter));
+      const args = expression.args.map((item) => inferExpressionType(item, parameters, eventParameter, variables));
       const one = (expected: PrimitiveType[], result: ExpressionType): ExpressionType => {
         if (args.length !== 1 || !expected.includes(args[0].type)) {
           throw new Error(`${expression.fn} expects one ${expected.join(' or ')} argument`);
@@ -397,12 +400,13 @@ export function evaluate(
   expression: Expr,
   parameters: ReadonlyMap<string, Value>,
   event?: EngineEvent,
+  variables: ReadonlyMap<string, Value> = new Map(),
 ): Value {
   switch (expression.kind) {
     case 'literal':
       return canonicalizeValue(expression.value);
     case 'parameter': {
-      const value = parameters.get(expression.id);
+      const value = parameters.get(expression.id) ?? variables.get(expression.id);
       if (!value) throw new Error(`Unknown parameter ${expression.id}`);
       return value;
     }
@@ -422,7 +426,7 @@ export function evaluate(
       return applyBinary('-', event.newValue, event.oldValue);
     }
     case 'unary': {
-      const operand = evaluate(expression.operand, parameters, event);
+      const operand = evaluate(expression.operand, parameters, event, variables);
       if (expression.op === 'not') {
         if (operand.type !== 'boolean') throw new Error('Boolean expected');
         return booleanValue(!operand.value);
@@ -430,22 +434,22 @@ export function evaluate(
       return decimalValue(numeric(operand).negate(), operand.type === 'integer' ? 'integer' : 'decimal');
     }
     case 'binary': {
-      const left = evaluate(expression.left, parameters, event);
+      const left = evaluate(expression.left, parameters, event, variables);
       if (expression.op === 'and' || expression.op === 'or') {
         if (left.type !== 'boolean') throw new Error('Boolean expected');
         if (expression.op === 'and' && !left.value) return booleanValue(false);
         if (expression.op === 'or' && left.value) return booleanValue(true);
       }
-      return applyBinary(expression.op, left, evaluate(expression.right, parameters, event));
+      return applyBinary(expression.op, left, evaluate(expression.right, parameters, event, variables));
     }
     case 'call': {
       if (expression.fn === 'if') {
         if (expression.args.length !== 3) throw new Error('if expects three arguments');
-        const condition = evaluate(expression.args[0], parameters, event);
+        const condition = evaluate(expression.args[0], parameters, event, variables);
         if (condition.type !== 'boolean') throw new Error('if condition must be boolean');
-        return evaluate(expression.args[condition.value ? 1 : 2], parameters, event);
+        return evaluate(expression.args[condition.value ? 1 : 2], parameters, event, variables);
       }
-      const args = expression.args.map((item) => evaluate(item, parameters, event));
+      const args = expression.args.map((item) => evaluate(item, parameters, event, variables));
       if (expression.fn === 'number') {
         if (args.length !== 1) throw new Error('number expects one argument');
         const value = args[0];

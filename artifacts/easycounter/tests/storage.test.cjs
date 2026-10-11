@@ -111,6 +111,7 @@ test('configuration, operation state, and successful history commit atomically',
   assert.equal(entry.revision, 2);
   assert.equal(entry.rootEvent.sourceId, 'plus');
   assert.equal(entry.changes.length, 1);
+  assert.deepEqual(entry.messages, []);
 
   await assert.rejects(repository.commitEngineExecution(database, project.id, operation), /уже изменилось/);
   assert.equal((await repository.listProjectOperationHistory(database, project.id)).length, 1);
@@ -244,10 +245,45 @@ test('migrates an existing version 1 project to the engine tables', async () => 
   try {
     const state = await repository.loadProjectEngineState(migrated, 'legacy');
     assert.deepEqual(state.config, { parameters: [], rules: [] });
-    assert.equal((await migrated.getFirstAsync('PRAGMA user_version;')).user_version, 2);
+    assert.equal((await migrated.getFirstAsync('PRAGMA user_version;')).user_version, 10);
+    assert.equal(await migrated.getFirstAsync("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'screen_widgets';") !== null, true);
   } finally {
     migrated.close();
   }
+});
+
+test('changing a parameter type resets its runtime value atomically', async () => {
+  const project = await repository.createProject(database, { name: 'Parameter type', description: '' });
+  let state = await repository.saveProjectEngineConfiguration(database, project.id, {
+    parameters: [{ id: 'item', name: 'Item', type: 'integer', kind: 'stored', initialValue: { type: 'integer', value: '1' } }], rules: [],
+  });
+  const changedType = { parameters: [{ id: 'item', name: 'Item', type: 'string', kind: 'stored', initialValue: { type: 'string', value: 'start' } }], rules: [] };
+  await assert.rejects(repository.saveProjectEngineConfiguration(database, project.id, changedType), /Type mismatch/);
+  state = await repository.saveProjectEngineConfiguration(database, project.id, changedType, ['item']);
+  assert.deepEqual(state.runtime.values.item, { type: 'string', value: 'start' });
+});
+
+test('all screen widget types, layout, accessibility, and bindings survive SQLite round trips', async () => {
+  const project = await repository.createProject(database, { name: 'Widget grid', description: '' });
+  const widgets = [
+    { id: 'wide', type: 'value', title: 'Wide', parameterId: 'value', screenId: project.screens[0].id, span: 2, visibleWhen: '@{value} > 0', titleExpression: 'text(@{value})', colorExpression: '"red"', accessibilityLabel: 'Значение' },
+    { id: 'button', type: 'button', title: 'Button', buttonId: 'button', screenId: project.screens[0].id, span: 1 },
+    { id: 'input', type: 'input', title: 'Input', parameterId: 'value', buttonId: 'input-event', screenId: project.screens[0].id, span: 1 },
+    { id: 'toggle', type: 'toggle', title: 'Toggle', parameterId: 'flag', buttonId: 'toggle-event', screenId: project.screens[0].id, span: 1 },
+    { id: 'group', type: 'container', title: 'Group', screenId: project.screens[0].id, span: 2, accessibilityLabel: 'Группа' },
+    { id: 'label', type: 'text', title: 'Static label', screenId: project.screens[0].id, span: 2, parentId: 'group' },
+    { id: 'select', type: 'select', title: 'Select', parameterId: 'value', buttonId: 'select-widget', optionsJson: '["0","1"]', screenId: project.screens[0].id, span: 1 },
+  ];
+  await repository.saveProjectEngineConfiguration(database, project.id, { parameters: [
+    { id: 'value', name: 'Value', kind: 'stored', type: 'integer', initialValue: { type: 'integer', value: '0' } },
+    { id: 'flag', name: 'Flag', kind: 'stored', type: 'boolean', initialValue: { type: 'boolean', value: false } },
+  ], rules: [] });
+  await repository.saveScreenWidgets(database, project.id, project.screens[0].id, widgets);
+  assert.deepEqual(await repository.listScreenWidgets(database, project.id, project.screens[0].id), widgets.map((widget, position) => ({ ...widget, position })));
+  await assert.rejects(repository.saveScreenWidgets(database, project.id, project.screens[0].id, [
+    { id: 'missing', type: 'value', title: 'Missing', parameterId: 'deleted', screenId: project.screens[0].id, position: 0 },
+  ]), /больше не существует/);
+  assert.equal((await repository.listScreenWidgets(database, project.id, project.screens[0].id)).length, widgets.length);
 });
 
 test('duplicates projects with distinct project and screen IDs', async () => {
@@ -281,4 +317,28 @@ test('rejects blank names and missing project/screen updates', async () => {
     repository.renameProjectScreen(database, 'missing', 'missing', 'Renamed'),
     /не существует/,
   );
+});
+
+
+test('waiting input is not persisted until response completes the operation', async () => {
+  const project = await repository.createProject(database, { name: 'Input continuation', description: '' });
+  const integer = (value) => ({ type: 'integer', value: String(value) });
+  const state = await repository.saveProjectEngineConfiguration(database, project.id, {
+    parameters: [{ id: 'Count', name: 'Count', kind: 'stored', type: 'integer', initialValue: integer(0) }],
+    rules: [{ id: 'prompt', name: 'Prompt', enabled: true, order: 0, triggerMode: 'each', eventSource: { type: 'button', id: 'go' }, actions: [
+      { type: 'add', parameterId: 'Count', expression: { kind: 'literal', value: integer(5) } },
+      { type: 'input', parameterId: 'Count', prompt: 'New value' },
+    ] }],
+  });
+  const pending = engine.execute(state, { type: 'button', sourceId: 'go' });
+  assert.equal(pending.status, 'suspended');
+  assert.equal(pending.reason, 'input');
+  assert.equal((await repository.loadProjectEngineState(database, project.id)).runtime.values.Count.value, '0');
+  assert.equal((await repository.listProjectOperationHistory(database, project.id)).length, 0);
+  const completed = pending.submitInput(integer(14));
+  assert.equal(completed.status, 'completed');
+  await repository.commitEngineExecution(database, project.id, completed);
+  assert.equal((await repository.loadProjectEngineState(database, project.id)).runtime.values.Count.value, '14');
+  const [entry] = await repository.listProjectOperationHistory(database, project.id);
+  assert.deepEqual(entry.changes.map((change) => [change.oldValue.value, change.newValue.value]), [['0', '5'], ['5', '14']]);
 });

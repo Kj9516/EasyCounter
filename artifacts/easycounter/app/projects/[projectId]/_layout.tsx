@@ -7,6 +7,9 @@ export default function ProjectStackLayout() {
       <Stack.Screen name="settings" options={{ title: 'Настройки проекта' }} />
       <Stack.Screen name="screens/new" options={{ title: 'Новый экран' }} />
       <Stack.Screen name="screens/[screenId]" options={{ title: 'Экран' }} />
+      <Stack.Screen name="parameters" options={{ title: 'Параметры' }} />
+      <Stack.Screen name="rules" options={{ title: 'Правила' }} />
+      <Stack.Screen name="history" options={{ title: 'История' }} />
     </Stack>
   );
 }
