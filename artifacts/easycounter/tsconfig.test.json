@@ -12,6 +12,6 @@
     "skipLibCheck": true,
     "types": []
   },
-  "include": ["storage/projectRepository.ts", "types/project.ts"],
+  "include": ["storage/projectRepository.ts", "types/project.ts", "engine/**/*.ts"],
   "exclude": ["node_modules", ".test-build"]
 }
